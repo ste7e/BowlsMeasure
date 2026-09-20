@@ -1,16 +1,22 @@
-# Bowls Measuring — Android / Kotlin / Jetpack Compose v0.1.2
+# Bowls Measuring — Android / Kotlin / Jetpack Compose v0.2
 
-Android rework of the original C#/Avalonia prototype. Native Kotlin + Jetpack Compose.
+Android prototype for measuring the relative distances of bowls from the jack in an oblique photograph.
 
-The prototype can take a photo, choose an existing photo, manually mark the jack and up to four woods, record apparent sizes, and compare raw image-space ordering with the experimental size/depth-corrected ordering.
+## v0.2 geometry experiment
 
-The current camera path uses Android's `TakePicturePreview` contract for a simple prototype. A later version should use CameraX for full-resolution capture and a controlled preview. Android's current stable CameraX release is 1.6.2.
+The manual marking workflow is retained: mark the jack centre/edge, then the centre/edge of up to four woods. The geometry now converts each apparent bowl radius into a relative camera-depth cue and fits all measured object centres to a common ground plane. Distances are measured after projecting the points onto that plane.
 
-The geometry deliberately remains the same experimental hypothesis as v0.1: apparent wood size is used as a relative camera-depth cue. The next mathematical step is an explicit ground-plane/camera model.
+This is deliberately still an experimental model rather than calibrated photogrammetry. The focal length and jack/wood diameter ratio remain adjustable parameters. The UI reports the RMS distance of the measured 3-D points from the fitted plane so we can see how well the measurements support the model.
 
-Open the folder in Android Studio and run it on an Android device/emulator.
-
+The camera path still uses Android's `TakePicturePreview` for the prototype. A later step should move to CameraX for full-resolution capture.
 
 ## Build toolchain
 
-This version uses Android Gradle Plugin 9.1.1 and is intended to be built with Gradle 9.3.1 and JDK 17. It compiles against Android API 37 to match the current Compose dependency set.
+- Android Gradle Plugin 9.1.1
+- Gradle 9.3.1
+- JDK 17
+- compileSdk / targetSdk 37
+- Kotlin 2.2.20 + Compose compiler plugin
+- Jetpack Compose BOM 2026.09.00
+
+AGP 9 no longer requires the `org.jetbrains.kotlin.android` plugin, so it is intentionally absent.

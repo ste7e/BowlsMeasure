@@ -31,14 +31,7 @@ import kotlin.math.hypot
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState);
-        setContent {
-            MaterialTheme {
-                Surface(Modifier.fillMaxSize()) {
-                    BowlsMeasuringScreen()
-                }
-            }
-        }
+        super.onCreate(savedInstanceState); setContent { MaterialTheme { Surface(Modifier.fillMaxSize()) { BowlsMeasuringScreen() } } }
     }
 }
 
@@ -86,7 +79,7 @@ private fun BowlsMeasuringScreen() {
     ) {
         Text("Bowls Measuring", style = MaterialTheme.typography.headlineSmall)
         Text(
-            "Prototype v0.1 — apparent wood size as a perspective/depth cue",
+            "Prototype v0.2 — size/depth cue + fitted ground plane",
             style = MaterialTheme.typography.bodySmall
         )
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -139,11 +132,11 @@ private fun BowlsMeasuringScreen() {
                     mode = MeasureMode.WOOD; pendingCentre = null; status =
                     "Wood $woodNumber: tap centre, then edge."
                 }) { Text("Add Wood") }
-            Button(enabled = measurements.any { it.name == "Jack" } && measurements.any {
+            Button(enabled = measurements.any { it.name == "Jack" } && measurements.count {
                 it.name.startsWith(
                     "Wood"
                 )
-            }, onClick = {
+            } >= 2, onClick = {
                 val jack = measurements.first { it.name == "Jack" };
                 val woods = measurements.filter { it.name.startsWith("Wood") }
                 val raw = woods.sortedBy {
@@ -154,21 +147,40 @@ private fun BowlsMeasuringScreen() {
                 }
                 val corrected = SizeDepthModel.calculate(
                     jack,
-                    jackRatio,
+                    jackRatio.toDouble(),
                     focalLength.toDouble(),
                     (bitmap?.width ?: 0) / 2.0,
                     (bitmap?.height ?: 0) / 2.0,
                     woods
                 )
-                resultText = buildString {
-                    appendLine("RAW IMAGE ORDER"); appendLine(raw.joinToString(" → ") { it.name }); appendLine(); appendLine(
-                    "SIZE-CORRECTED ORDER"
-                ); appendLine(corrected.joinToString(" → ") { it.name }); appendLine(); appendLine("RELATIVE CORRECTED DISTANCES"); corrected.forEach {
-                    appendLine(
-                        "${it.rank}. ${it.name}   ${"%.3f".format(it.relativeDistance)} × nearest"
-                    )
+                if (corrected == null) {
+                    resultText =
+                        "The ground-plane model needs at least two woods plus the jack. Add another wood and calculate again."
+                    status = "Not enough points for a plane fit."
+                } else {
+                    resultText = buildString {
+                        appendLine("RAW IMAGE ORDER")
+                        appendLine(raw.joinToString(" → ") { it.name })
+                        appendLine()
+                        appendLine("GROUND-PLANE CORRECTED ORDER")
+                        appendLine(corrected.measurements.joinToString(" → ") { it.name })
+                        appendLine()
+                        appendLine("RELATIVE CORRECTED DISTANCES")
+                        corrected.measurements.forEach {
+                            appendLine(
+                                "${it.rank}. ${it.name}   ${
+                                    "%.3f".format(
+                                        it.relativeDistance
+                                    )
+                                } × nearest"
+                            )
+                        }
+                        appendLine()
+                        appendLine("PLANE FIT RMS: ${"%.4f".format(corrected.planeRms)}")
+                        appendLine("(smaller means the measured centres/sizes lie more closely on one plane)")
+                    }
+                    status = "Ground-plane calculation complete."
                 }
-                }; status = "Calculation complete."
             }) { Text("Calculate") }
         }
         Card(Modifier.fillMaxWidth()) {
@@ -231,13 +243,17 @@ private fun MeasurementCanvas(
                 .aspectRatio(image.width.toFloat() / image.height.toFloat())
                 .pointerInput(image) {
                     detectTapGestures { offset ->
-                        val sx = image.width.toFloat() / size.width
-                        val sy = image.height.toFloat() / size.height
-                        onTap(Point2(offset.x * sx, offset.y * sy))
+                        val sx = image.width.toFloat() / size.width;
+                        val sy = image.height.toFloat() / size.height; onTap(
+                        Point2(
+                            offset.x * sx,
+                            offset.y * sy
+                        )
+                    )
                     }
                 }) {
             drawImage(image, dstSize = IntSize(size.width.toInt(), size.height.toInt()))
-            val sx = size.width / image.width.toFloat()
+            val sx = size.width / image.width.toFloat();
             val sy = size.height / image.height.toFloat()
             measurements.forEach { m ->
                 val c = Offset(m.centre.x * sx, m.centre.y * sy);
