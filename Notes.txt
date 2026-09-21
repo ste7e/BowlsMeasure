@@ -1,0 +1,14 @@
+Tips for Future Fine-Tuning
+Now that the baseline selection architecture is solid, here are two areas you can easily tweak if you test on other images with different lighting or grass conditions:
+1.
+Adjusting Sensitivity (accSteps): Inside detectNear, the accSteps list handles how strict the voting accumulator is (listOf(50.0, 35.0, 20.0, 12.0)).
+◦
+If a bowl on a very dark shadow or a highly reflective surface isn't registering, you can append a lower value like 8.0 to the end of the list to make it even more permissive as a last resort.
+◦
+If a click occasionally picks up a tight patch of clover or textured grass right next to a bowl, you can remove 12.0 to keep the detector strict.
+2.
+The Yellow Jack vs. Black Woods: Because the pipeline converts everything to grayscale (Imgproc.COLOR_RGBA2GRAY), the yellow jack can sometimes have lower contrast against green grass than the solid black bowls do.
+◦
+If you ever find that the yellow jack is harder to select with a tap, look at verifyCircle. The line if (abs(dot) > 0.3) determines how closely the grass-to-bowl gradient matches a perfect circle's vector. Lowering 0.3 to 0.25 will make it slightly friendlier to the softer edge transitions found on brightly colored objects.
+You have a really robust, resolution-independent computer vision module ready to go. Great work getting this working on the green!
+

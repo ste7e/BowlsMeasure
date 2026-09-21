@@ -14,6 +14,12 @@ android {
         versionName = "0.1"
     }
     buildFeatures { compose = true }
+    
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
 }
 
 dependencies {
@@ -27,4 +33,5 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.10.0")
     debugImplementation("androidx.compose.ui:ui-tooling")
+    implementation("org.opencv:opencv:5.0.0")
 }
