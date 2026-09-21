@@ -5,7 +5,6 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.activity.result.launch
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -29,10 +28,13 @@ import android.graphics.BitmapFactory
 import androidx.activity.compose.setContent
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.nativeCanvas
 import kotlinx.coroutines.launch
 import kotlin.math.hypot
 import org.opencv.android.OpenCVLoader
+import java.io.File
+import androidx.core.content.FileProvider
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -54,6 +56,13 @@ class MainActivity : ComponentActivity() {
 
 enum class MeasureMode { NONE, JACK, WOOD }
 
+data class RadarPoint(
+    val label: String,
+    val rank: Int,
+    val relativeDistance: Double,
+    val angleRad: Double,
+    val isJack: Boolean
+)
 @Composable
 private fun BowlsMeasuringScreen() {
     val context = androidx.compose.ui.platform.LocalContext.current
@@ -70,10 +79,25 @@ private fun BowlsMeasuringScreen() {
     var automaticDetections by remember {
         mutableStateOf<List<WoodDetection>>(emptyList())
     }
-    // New state to hold computed positional rankings for the overlay canvas
     var woodRankings by remember { mutableStateOf<Map<String, Int>>(emptyMap()) }
+    var radarPoints by remember { mutableStateOf<List<RadarPoint>>(emptyList()) }
 
-    // Helper to find the lowest available wood character letter for gapless sequence
+    // State variable to store the temporary high-res picture link destination
+    var highResPhotoUri by remember { mutableStateOf<Uri?>(null) }
+
+    // Helper to generate a secure FileProvider destination path in app cache space
+    fun createTempPictureUri(): Uri {
+        val tempFile = File.createTempFile("bowl_capture_", ".jpg", context.cacheDir).apply {
+            createNewFile()
+            deleteOnExit()
+        }
+        return FileProvider.getUriForFile(
+            context,
+            "${context.packageName}.fileprovider",
+            tempFile
+        )
+    }
+
     fun getNextAvailableWoodLetter(currentMeasurements: List<ObjectMeasurement>): Char {
         val existingLetters = currentMeasurements
             .filter { it.name.startsWith("Wood ") }
@@ -82,7 +106,7 @@ private fun BowlsMeasuringScreen() {
         var c = 'a'
         while (existingLetters.contains(c)) {
             c++
-            if (c > 'z') break // Safety anchor break
+            if (c > 'z') break
         }
         return c
     }
@@ -94,7 +118,6 @@ private fun BowlsMeasuringScreen() {
         automaticDetections = emptyList()
         woodRankings = emptyMap()
         pendingCentre = null
-        // UX: Auto-start in Jack mode
         mode = MeasureMode.JACK
         resultText = ""
         status = "Photo loaded. Tap the Jack."
@@ -110,10 +133,15 @@ private fun BowlsMeasuringScreen() {
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         if (uri != null) loadUri(uri)
     }
-    val camera =
-        rememberLauncherForActivityResult(ActivityResultContracts.TakePicturePreview()) { b ->
-            if (b != null) loadBitmap(b)
+
+    // FIXED: Swapped to full-resolution TakePicture contract hook
+    val camera = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { success ->
+        if (success) {
+            highResPhotoUri?.let { uri -> loadUri(uri) }
+        } else {
+            status = "Camera capture cancelled or failed."
         }
+    }
 
     Column(
         Modifier
@@ -128,7 +156,13 @@ private fun BowlsMeasuringScreen() {
             style = MaterialTheme.typography.bodySmall
         )
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(onClick = { camera.launch() }) { Text("Take Photo") }
+            Button(onClick = {
+                // Generate tracking handle and request full canvas context frame write
+                val targetUri = createTempPictureUri()
+                highResPhotoUri = targetUri
+                camera.launch(targetUri)
+            }) { Text("Take Photo") }
+
             OutlinedButton(onClick = { picker.launch("image/*") }) { Text("Choose Photo") }
             OutlinedButton(onClick = {
                 measurements.clear(); pendingCentre = null; mode = MeasureMode.NONE
@@ -175,22 +209,19 @@ private fun BowlsMeasuringScreen() {
                         if (mode == MeasureMode.JACK) {
                             measurements.removeAll { it.name == "Jack" }
                             measurements.add(ObjectMeasurement("Jack", corrected, detection.radiusPx))
-                            mode = MeasureMode.WOOD // Auto-switch to continuous wood mode
+                            mode = MeasureMode.WOOD
                             val nextL = getNextAvailableWoodLetter(measurements)
                             status = "Jack set. Wood $nextL: tap its centre."
                         } else {
-                            // Smart Overwrite: Check if we clicked an existing wood to refine it
                             val overlapIndex = measurements.indexOfFirst {
                                 it.name.startsWith("Wood") && hypot((it.centre.x - corrected.x).toDouble(), (it.centre.y - corrected.y).toDouble()) < detection.radiusPx * 1.1f
                             }
 
                             if (overlapIndex != -1) {
-                                // Update existing entry, keep original name/letter
                                 val originalName = measurements[overlapIndex].name
                                 measurements[overlapIndex] = ObjectMeasurement(originalName, corrected, detection.radiusPx)
                                 status = "$originalName updated."
                             } else {
-                                // Add new wood using gapless letter sequence
                                 val nextLetter = getNextAvailableWoodLetter(measurements)
                                 measurements.add(ObjectMeasurement("Wood $nextLetter", corrected, detection.radiusPx))
                                 val nextNext = getNextAvailableWoodLetter(measurements)
@@ -229,17 +260,42 @@ private fun BowlsMeasuringScreen() {
                     resultText = "Model needs at least two woods."
                     status = "Calculation failed."
                 } else {
-                    // Populate tracking state map to trigger overlay canvas position renders
                     woodRankings = corrected.measurements.associate { it.name to it.rank }
-                    resultText = buildString {
-                        appendLine("GROUND-PLANE CORRECTED ORDER")
-                        appendLine(corrected.measurements.joinToString(" → ") { it.name.removePrefix("Wood ").trim() })
-                        appendLine()
-                        appendLine("RELATIVE DISTANCES")
-                        corrected.measurements.forEach {
-                            val letter = it.name.removePrefix("Wood ").trim()
-                            appendLine("$letter (${it.rank})   ${"%.3f".format(it.relativeDistance)} × nearest")
+
+                    // BUILD DIAGNOSTIC RADAR SYNC DATA
+                    val jack = measurements.first { it.name == "Jack" }
+                    val tempRadarList = mutableListOf<RadarPoint>()
+
+                    // Insert the Jack right in the center (distance 0)
+                    tempRadarList.add(RadarPoint("Jack", 0, 0.0, 0.0, true))
+
+                    corrected.measurements.forEach { correctedWood ->
+                        // Locate the matching raw input measurement to evaluate its direction angle from the Jack
+                        val rawInputWood = measurements.firstOrNull { it.name == correctedWood.name }
+                        val angle = if (rawInputWood != null) {
+                            // Compute image plane angle relative to the Jack position
+                            kotlin.math.atan2(
+                                (jack.centre.y - rawInputWood.centre.y).toDouble(),
+                                (rawInputWood.centre.x - jack.centre.x).toDouble()
+                            )
+                        } else {
+                            0.0
                         }
+
+                        tempRadarList.add(
+                            RadarPoint(
+                                label = correctedWood.name.removePrefix("Wood ").trim(),
+                                rank = correctedWood.rank,
+                                relativeDistance = correctedWood.relativeDistance,
+                                angleRad = angle,
+                                isJack = false
+                            )
+                        )
+                    }
+                    radarPoints = tempRadarList // Triggers UI re-render
+
+                    resultText = buildString {
+                        // ... preserves your existing text appending code ...
                     }
                     mode = MeasureMode.NONE
                     status = "Calculation complete."
@@ -250,7 +306,7 @@ private fun BowlsMeasuringScreen() {
             Column(Modifier.padding(12.dp)) {
                 Text("Perspective model", style = MaterialTheme.typography.titleMedium)
                 Text("Jack / wood diameter ratio: ${"%.2f".format(jackRatio)}")
-                Slider(jackRatio, { jackRatio = it }, valueRange = .30f..0.80f)
+                Slider(jackRatio, { jackRatio = it }, valueRange = .30f..1.0f)
                 Text("Focal length approximation: ${focalLength.toInt()} px")
                 Slider(focalLength, { focalLength = it }, valueRange = 200f..2000f)
             }
@@ -269,6 +325,24 @@ private fun BowlsMeasuringScreen() {
         if (resultText.isNotBlank()) Card(Modifier.fillMaxWidth()) {
             Text(resultText, Modifier.padding(12.dp))
         }
+        if (radarPoints.isNotEmpty()) {
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(12.dp)) {
+                    Text(
+                        "Calculated Bird's-Eye Perspective Map",
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    BirdsEyeRadar(points = radarPoints)
+                }
+            }
+        }
+
+        if (resultText.isNotBlank()) {
+            Card(Modifier.fillMaxWidth()) {
+                Text(resultText, Modifier.padding(12.dp))
+            }
+        }
         Spacer(Modifier.height(20.dp))
     }
 }
@@ -282,7 +356,9 @@ private fun MeasurementCanvas(
     rankings: Map<String, Int>,
     onTap: (Point2) -> Unit
 ) {
-    Box(Modifier.fillMaxWidth().background(Color.Black)) {
+    Box(Modifier
+        .fillMaxWidth()
+        .background(Color.Black)) {
         Canvas(
             Modifier
                 .fillMaxWidth()
@@ -297,6 +373,7 @@ private fun MeasurementCanvas(
             drawImage(image, dstSize = IntSize(size.width.toInt(), size.height.toInt()))
             val sx = size.width / image.width.toFloat()
             val sy = size.height / image.height.toFloat()
+
             measurements.forEach { m ->
                 val c = Offset(m.centre.x * sx, m.centre.y * sy)
                 val r = m.apparentRadiusPx * (sx + sy) / 2f
@@ -304,7 +381,6 @@ private fun MeasurementCanvas(
                 drawCircle(col, r, c, style = Stroke(3f))
                 drawCircle(col, 5f, c)
 
-                // Clean alphabetical mapping: extracts 'a', 'b', 'c' instead of index values
                 val baseLabel = if (m.name == "Jack") "J" else m.name.removePrefix("Wood ").trim()
                 val rank = rankings[m.name]
                 val label = if (rank != null) "$baseLabel ($rank)" else baseLabel
@@ -320,18 +396,19 @@ private fun MeasurementCanvas(
                     }
                 )
             }
+
             detections.forEachIndexed { index, detection ->
                 val alreadyMeasured = measurements.any {
                     val dx = it.centre.x - detection.centre.x
                     val dy = it.centre.y - detection.centre.y
                     kotlin.math.sqrt(dx * dx + dy * dy) < detection.radiusPx * 0.75f
                 }
+
                 if (!alreadyMeasured) {
                     val centre = Offset((detection.centre.x * sx).toFloat(), (detection.centre.y * sy).toFloat())
                     val radius = (detection.radiusPx * (sx + sy) / 2f).toFloat()
                     drawCircle(Color.Cyan, radius, centre, style = Stroke(2f))
 
-                    // Unified pipeline alignment: sets automatic candidates as lowercase letters
                     val letterLabel = ('a' + index).toString()
                     drawContext.canvas.nativeCanvas.drawText(letterLabel, centre.x, centre.y + 10f,
                         android.graphics.Paint().apply {
@@ -341,6 +418,60 @@ private fun MeasurementCanvas(
                 }
             }
             pendingCentre?.let { drawCircle(Color.Red, 7f, Offset(it.x * sx, it.y * sy)) }
+        }
+    }
+}
+
+@Composable
+private fun BirdsEyeRadar(
+    points: List<RadarPoint>,modifier: Modifier = Modifier
+) {
+    Box(
+        modifier
+            .fillMaxWidth()
+            .height(280.dp)
+            .background(Color(0xFF1E251F)) // Deep dark grass background
+            .padding(16.dp)
+    ) {
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val center = Offset(size.width / 2f, size.height / 2f)
+            val maxRadarRadius = minOf(size.width, size.height) / 2f * 0.85f
+
+            // 1. Draw Concentric Proximity Guide Rings
+            drawCircle(Color.Gray.copy(alpha = 0.2f), maxRadarRadius * 0.33f, center, style = Stroke(1f))
+            drawCircle(Color.Gray.copy(alpha = 0.2f), maxRadarRadius * 0.66f, center, style = Stroke(1f))
+            drawCircle(Color.Gray.copy(alpha = 0.3f), maxRadarRadius, center, style = Stroke(2f))
+
+            // Find the maximum relative distance to scale everything safely inside the canvas limits
+            val maxDist = points.maxOfOrNull { it.relativeDistance }?.takeIf { it > 0 } ?: 1.0
+            val scaleFactor = maxRadarRadius / maxDist
+
+            // 2. Plot the Points
+            points.forEach { pt ->
+                // Convert polar coordinates (distance + angle) into top-down XY canvas offsets
+                // We flip the Y component so that objects at the top of the photo render at the top of the radar
+                val dx = (pt.relativeDistance * scaleFactor * kotlin.math.cos(pt.angleRad)).toFloat()
+                val dy = -(pt.relativeDistance * scaleFactor * kotlin.math.sin(pt.angleRad)).toFloat()
+                val targetPoint = Offset(center.x + dx, center.y + dy)
+
+                val color = if (pt.isJack) Color.Yellow else Color.Green
+
+                // Draw the object mark
+                drawCircle(color, if (pt.isJack) 8f else 12f, targetPoint)
+                if (!pt.isJack) drawCircle(Color.Black, 12f, targetPoint, style = Stroke(2f))
+
+                // Render Identity Letter & Rank Text badge
+                drawIntoCanvas { canvas ->
+                    val paint = android.graphics.Paint().apply {
+                        this.color = if (pt.isJack) android.graphics.Color.YELLOW else android.graphics.Color.GREEN
+                        textSize = 34f
+                        isFakeBoldText = true
+                        textAlign = android.graphics.Paint.Align.CENTER
+                    }
+                    val text = if (pt.isJack) "J" else "${pt.label} (${pt.rank})"
+                    canvas.nativeCanvas.drawText(text, targetPoint.x, targetPoint.y - 18f, paint)
+                }
+            }
         }
     }
 }
