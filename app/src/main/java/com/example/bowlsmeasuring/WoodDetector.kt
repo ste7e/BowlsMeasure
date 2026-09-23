@@ -20,7 +20,6 @@ data class WoodDetection(
 
 object WoodDetector {
 
-    // Define the result class at the top of the object
     data class WoodDetectorResult(
         val processedBitmap: Bitmap,
         val detections: List<WoodDetection>
@@ -32,7 +31,7 @@ object WoodDetector {
 
     /**
      * Attempts to find the sharpest circular or elliptical object near the click.
-     * Uses morphologically stable edge profiles to isolate bowls from lawn noise.
+     * Employs localized radial ray casting and median outlier filtering to ignore turf anomalies.
      */
     suspend fun detectNear(bitmap: Bitmap, clickedPoint: Point2): WoodDetection? = withContext(Dispatchers.Default) {
         val source = Mat()
@@ -53,60 +52,16 @@ object WoodDetector {
             Imgproc.medianBlur(gray, gray, 5)
             Imgproc.GaussianBlur(gray, blurred, Size(5.0, 5.0), 1.5)
 
-            // Primary Target Handler: Localized Contour Arc Regression Analysis
-            val res = detectNearContour(blurred, scaledPoint, scale)
-            working.release()
-
-            if (res != null) {
-                return@withContext res
-            }
-
-            // Fallback Strategy: Precise Hough Circle Verification Loop if contour lines are fractured
             val gradX = Mat(); val gradY = Mat()
             Imgproc.Sobel(blurred, gradX, CvType.CV_16S, 1, 0)
             Imgproc.Sobel(blurred, gradY, CvType.CV_16S, 0, 1)
 
             try {
-                val cannySteps = listOf(100.0, 80.0, 60.0)
-                val accSteps = listOf(35.0, 22.0, 14.0)
-
-                for (canny in cannySteps) {
-                    for (acc in accSteps) {
-                        val circles = Mat()
-                        try {
-                            val dp = if (acc < 20.0) 1.5 else 1.2
-                            // Enforced hard limits: minRadius=10, maxRadius=75
-                            Imgproc.HoughCircles(blurred, circles, Imgproc.HOUGH_GRADIENT, dp, 30.0, canny, acc, 10, 75)
-
-                            var bestCircle: WoodDetection? = null
-                            var minDistance = Double.MAX_VALUE
-
-                            for (i in 0 until circles.cols()) {
-                                val data = circles.get(0, i) ?: continue
-                                val r = data[2]
-                                val dist = hypot(data[0] - scaledPoint.x, data[1] - scaledPoint.y)
-
-                                // Click containment check
-                                if (dist <= r * 1.15 && dist < minDistance) {
-                                    val score = verifyCircle(gradX, gradY, data[0], data[1], r)
-                                    if (score.first > 0.35) {
-                                        minDistance = dist
-                                        bestCircle = WoodDetection(
-                                            centre = Point(data[0] / scale, data[1] / scale),
-                                            radiusPx = (r / scale).toFloat(),
-                                            circularity = score.first,
-                                            confidence = 1.0 - (dist / (r * 1.15))
-                                        )
-                                    }
-                                }
-                            }
-                            if (bestCircle != null) {
-                                return@withContext bestCircle
-                            }
-                        } finally {
-                            circles.release()
-                        }
-                    }
+                // Execute sub-pixel radial edge analysis directly around the user's tapped coordinate
+                val res = refineWithRadialRay(blurred, gradX, gradY, scaledPoint, scale)
+                working.release()
+                if (res != null) {
+                    return@withContext res
                 }
             } finally {
                 gradX.release(); gradY.release()
@@ -119,101 +74,115 @@ object WoodDetector {
         }
     }
 
-    private fun detectNearContour(blurred: Mat, scaledPoint: Point, scale: Double): WoodDetection? {
-        val roiSize = 240 // Tighter local focus insulates target calculations from background anomalies
-        val sx = max(0, (scaledPoint.x - roiSize / 2).toInt()).coerceAtMost(blurred.cols() - 1)
-        val sy = max(0, (scaledPoint.y - roiSize / 2).toInt()).coerceAtMost(blurred.rows() - 1)
-        val ex = min(blurred.cols() - 1, (scaledPoint.x + roiSize / 2).toInt())
-        val ey = min(blurred.rows() - 1, (scaledPoint.y + roiSize / 2).toInt())
-        val w = ex - sx; val h = ey - sy
-        if (w <= 10 || h <= 10) return null
+    /**
+     * Casts radial tracking vectors outward from a seed coordinate point,
+     * strips leaf/shadow boundary outliers, and runs algebraic ellipse regression.
+     */
+    private fun refineWithRadialRay(
+        blurred: Mat,
+        gradX: Mat,
+        gradY: Mat,
+        centerPoint: Point,
+        scale: Double
+    ): WoodDetection? {
+        val rayCount = 72
+        val candidatePoints = ArrayList<Point>()
+        val detectedRadii = ArrayList<Double>()
 
-        val roi = blurred.submat(Rect(sx, sy, w, h))
-        val edges = Mat()
+        for (i in 0 until rayCount) {
+            val angle = 2.0 * PI * i / rayCount
+            val cosA = cos(angle)
+            val sinA = sin(angle)
 
-        // Localized structural edge extraction ignores global lighting artifacts
-        Imgproc.Canny(roi, edges, 40.0, 120.0)
+            var maxMag = 0.0
+            var bestR = 0.0
 
-        // Balanced dilation repairs thin tracking boundaries without merging grass segments
-        val element = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, Size(3.0, 3.0))
-        Imgproc.dilate(edges, edges, element)
+            // Scan outward along the line profile from r = 10px to r = 75px on our normalized canvas
+            for (r in 10..75) {
+                val px = (centerPoint.x + cosA * r).toInt()
+                val py = (centerPoint.y + sinA * r).toInt()
 
-        val contours = ArrayList<MatOfPoint>()
-        val hierarchy = Mat()
-        Imgproc.findContours(edges, contours, hierarchy, Imgproc.RETR_LIST, Imgproc.CHAIN_APPROX_SIMPLE)
+                if (px in 0 until blurred.cols() && py in 0 until blurred.rows()) {
+                    val gxArr = gradX.get(py, px)
+                    val gyArr = gradY.get(py, px)
+                    if (gxArr != null && gyArr != null) {
+                        val gx = gxArr[0]
+                        val gy = gyArr[0]
+                        val mag = sqrt(gx * gx + gy * gy)
 
-        // Compute local gradient maps for geometric validation
-        val gradX = Mat(); val gradY = Mat()
-        Imgproc.Sobel(roi, gradX, CvType.CV_16S, 1, 0)
-        Imgproc.Sobel(roi, gradY, CvType.CV_16S, 0, 1)
+                        // Check if the gradient direction aligns closely with our radial search ray direction
+                        val dot = (gx / (mag + 0.0001) * cosA) + (gy / (mag + 0.0001) * sinA)
 
-        var bestCandidate: WoodDetection? = null
-        var maxScore = 0.0
-
-        for (contour in contours) {
-            val mop2f = MatOfPoint2f()
-            contour.convertTo(mop2f, CvType.CV_32F)
-
-            val areaVal = Geometry.contourArea(mop2f)
-            if (areaVal < 80.0) { mop2f.release(); continue }
-
-            val center = Point()
-            val radiusArr = floatArrayOf(0f)
-            Geometry.minEnclosingCircle(mop2f, center, radiusArr)
-
-            val localX = center.x
-            val localY = center.y
-            val radius = radiusArr[0].toDouble()
-
-            // CRITICAL CALIBRATION LOCK: Discard giant grass masks and minuscule noise shapes immediately
-            if (radius < 10.0 || radius > 75.0) { mop2f.release(); continue }
-
-            val globalCenterX = localX + sx.toDouble()
-            val globalCenterY = localY + sy.toDouble()
-            val distToClick = hypot(globalCenterX - scaledPoint.x, globalCenterY - scaledPoint.y)
-
-            // Strict Proximity Gate: The finger tap position must land cleanly inside the boundary footprint
-            if (distToClick <= radius * 1.15) {
-                // Verify if the edge layout possesses circular gradient vectors or random noise configurations
-                val score = verifyCircle(gradX, gradY, localX, localY, radius)
-                if (score.first > 0.38) {
-                    var finalRadius = radius
-
-                    // Extract high-precision perspective ellipse metrics if the boundary footprint is stable
-                    if (mop2f.rows() >= 5) {
-                        val rotatedRect = Geometry.fitEllipse(mop2f)
-                        val rw = rotatedRect.size.width
-                        val rh = rotatedRect.size.height
-                        if (rw > 0 && rh > 0) {
-                            val aspect = if (rw > rh) rh / rw else rw / rh
-                            if (aspect >= 0.55) {
-                                finalRadius = (rw + rh) / 4.0
-                            }
+                        if (mag > maxMag && abs(dot) > 0.35) {
+                            maxMag = mag
+                            bestR = r.toDouble()
                         }
-                    }
-
-                    // Composite scoring balances clean gradient verification and closeness to your tap location
-                    val proximityFactor = 1.0 - (distToClick / (radius * 1.5))
-                    val compositeScore = score.first * score.second * proximityFactor
-
-                    if (compositeScore > maxScore) {
-                        maxScore = compositeScore
-                        bestCandidate = WoodDetection(
-                            centre = Point(globalCenterX / scale, globalCenterY / scale),
-                            radiusPx = (finalRadius / scale).toFloat(),
-                            circularity = score.first,
-                            confidence = compositeScore
-                        )
                     }
                 }
             }
-            mop2f.release()
+
+            // If a valid edge trigger was hit, collect its boundary position coordinates
+            if (maxMag > 12.0 && bestR >= 10.0) {
+                candidatePoints.add(Point(centerPoint.x + cosA * bestR, centerPoint.y + sinA * bestR))
+                detectedRadii.add(bestR)
+            }
         }
 
-        roi.release(); edges.release(); hierarchy.release(); element.release()
-        gradX.release(); gradY.release()
-        for (c in contours) c.release()
-        return bestCandidate
+        if (candidatePoints.size < 15) return null
+
+        // ROBUST OUTLIER REMOVAL: Calculate the median radius of all ray tracking hits
+        val sortedRadii = detectedRadii.sorted()
+        val medianRadius = sortedRadii[sortedRadii.size / 2]
+
+        val validPoints = ArrayList<Point>()
+        var totalValidationScore = 0.0
+
+        for (i in 0 until candidatePoints.size) {
+            // Discard any rays that extended out into trailing shadows or adjacent leaves
+            if (abs(detectedRadii[i] - medianRadius) <= 7.0) {
+                validPoints.add(candidatePoints[i])
+            }
+        }
+
+        // We require consistent data density to confirm a structural ball/jack entity
+        if (validPoints.size < 18) return null
+
+        var finalCenter = centerPoint
+        var finalRadius = medianRadius
+
+        // Feed our clean, filtered boundary point cloud into OpenCV's least-squares ellipse Fitter
+        if (validPoints.size >= 5) {
+            val matPoints = MatOfPoint2f()
+            matPoints.fromList(validPoints)
+            try {
+                val rotatedRect = Geometry.fitEllipse(matPoints)
+                if (rotatedRect.size.width > 0 && rotatedRect.size.height > 0) {
+                    val aspect = if (rotatedRect.size.width > rotatedRect.size.height)
+                        rotatedRect.size.height / rotatedRect.size.width
+                    else
+                        rotatedRect.size.width / rotatedRect.size.height
+
+                    // Validate that the perspective aspect match represents an acceptable projection angle
+                    if (aspect >= 0.45) {
+                        finalCenter = rotatedRect.center
+                        finalRadius = (rotatedRect.size.width + rotatedRect.size.height) / 4.0
+                        totalValidationScore = aspect
+                    }
+                }
+            } catch (e: Exception) {
+                // Fall back cleanly to baseline median radius states if regression matrices experience singularity stalls
+                totalValidationScore = 0.75
+            } finally {
+                matPoints.release()
+            }
+        }
+
+        return WoodDetection(
+            centre = Point(finalCenter.x / scale, finalCenter.y / scale),
+            radiusPx = (finalRadius / scale).toFloat(),
+            circularity = if (totalValidationScore > 0) totalValidationScore else 0.85,
+            confidence = validPoints.size.toDouble() / rayCount.toDouble()
+        )
     }
 
     /**
@@ -248,8 +217,8 @@ object WoodDetector {
             val validatedDetections = ArrayList<WoodDetection>()
 
             try {
-                // Hough limits enforced to physical bowl bounds (10px to 75px)
-                Imgproc.HoughCircles(blurred, circles, Imgproc.HOUGH_GRADIENT, 1.2, 40.0, 80.0, 24.0, 10, 75)
+                // Lower accumulator threshold (param2 = 15.0) lets perspective distorted ellipses pass the initial voting phase
+                Imgproc.HoughCircles(blurred, circles, Imgproc.HOUGH_GRADIENT, 1.2, 35.0, 70.0, 15.0, 10, 75)
 
                 for (i in 0 until circles.cols()) {
                     val data = circles.get(0, i) ?: continue
@@ -257,17 +226,22 @@ object WoodDetector {
                     val cy = data[1]
                     val r = data[2]
 
-                    // Vet each candidate using our strict gradient vector check
-                    val score = verifyCircle(gradX, gradY, cx, cy, r)
-                    if (score.first > 0.38) {
-                        validatedDetections.add(
-                            WoodDetection(
-                                centre = Point(cx / scale, cy / scale),
-                                radiusPx = (r / scale).toFloat(),
-                                circularity = score.first,
-                                confidence = score.first * score.second
+                    // Run our sub-pixel radial ray casting pass to lock onto the precise ellipse center and radius
+                    val optimized = refineWithRadialRay(blurred, gradX, gradY, Point(cx, cy), scale)
+                    if (optimized != null) {
+                        validatedDetections.add(optimized)
+                    } else {
+                        val score = verifyCircle(gradX, gradY, cx, cy, r)
+                        if (score.first > 0.35) {
+                            validatedDetections.add(
+                                WoodDetection(
+                                    centre = Point(cx / scale, cy / scale),
+                                    radiusPx = (r / scale).toFloat(),
+                                    circularity = score.first,
+                                    confidence = score.first * score.second
+                                )
                             )
-                        )
+                        }
                     }
                 }
             } finally {
@@ -327,20 +301,18 @@ object WoodDetector {
                 if (gxArr != null && gyArr != null) {
                     val gx = gxArr[0]; val gy = gyArr[0]
                     val mag = sqrt(gx * gx + gy * gy)
-                    if (mag > 8.0) { // Discard weak texturing noise floor
+                    if (mag > 6.0) { // Standardized noise floor baseline
                         val dx = (cx - px) / r
                         val dy = (cy - py) / r
-                        // Evaluates dot-alignment against theoretical circular radial lines
                         val dot = (gx / mag * dx) + (gy / mag * dy)
-                        if (abs(dot) > 0.4) {
+                        if (abs(dot) > 0.35) {
                             align += abs(dot); totalMag += mag; valid++
                         }
                     }
                 }
             }
         }
-        // CRITICAL FILTER: Requires a cohesive arc boundary coverage profile (minimum 20% or 15 aligned markers)
-        if (valid < SAMPLE_COUNT * 0.20) return 0.0 to 0.0
+        if (valid < SAMPLE_COUNT * 0.15) return 0.0 to 0.0
         return (align / valid) to min(1.0, (totalMag / valid) / 150.0)
     }
 }

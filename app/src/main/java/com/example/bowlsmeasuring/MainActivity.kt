@@ -258,17 +258,29 @@ private fun BowlsMeasuringScreen(viewModel: BowlsViewModel) {
             }) { Text("Clear") }
         }
 
+// Inside MainActivity.kt -> Look for the "Detect Woods" Button click handler:
         OutlinedButton(
             enabled = viewModel.bitmap != null,
             onClick = {
                 val b = viewModel.bitmap ?: return@OutlinedButton
-                viewModel.status = "Detecting circular objects..."
+                viewModel.status = "Detecting circular objects via Peak Distance Transform..."
                 scope.launch {
-                    val woodDetectorResult = WoodDetector.detect(b)
-                    viewModel.automaticDetections = woodDetectorResult.detections
-                    viewModel.bitmap = woodDetectorResult.processedBitmap
-                    viewModel.imageBitmap = woodDetectorResult.processedBitmap.asImageBitmap()
-                    viewModel.status = "Detected ${viewModel.automaticDetections.size} circular candidates."
+                    // 1. Execute our new peak blob detection pass
+                    val blobDetections = SimpleBlobDetector.detect(b)
+
+                    // 2. Map the results cleanly over into your existing UI-compatible WoodDetection format
+                    viewModel.automaticDetections = blobDetections.map { blob ->
+                        // Map Point2 format directly across boundaries
+                        val cvPoint = org.opencv.core.Point(blob.centre.x.toDouble(), blob.centre.y.toDouble())
+                        WoodDetection(
+                            centre = cvPoint,
+                            radiusPx = blob.radiusPx,
+                            circularity = blob.solidity,
+                            confidence = blob.solidity
+                        )
+                    }
+
+                    viewModel.status = "Detected ${viewModel.automaticDetections.size} stable circular objects."
                 }
             }
         ) {
@@ -291,13 +303,17 @@ private fun BowlsMeasuringScreen(viewModel: BowlsViewModel) {
             ) { point ->
                 if (viewModel.mode == MeasureMode.NONE) return@MeasurementCanvas
 
-                viewModel.status = "Fitting ellipse..."
+// Inside MainActivity.kt -> Locate the tap listener processing block inside MeasurementCanvas:
+                viewModel.status = "Fitting ellipse using SBD Peak Fields..."
                 scope.launch {
                     val b = viewModel.bitmap ?: return@launch
-                    val detection = WoodDetector.detectNear(b, point)
+
+                    // 1. Invoke the new shadow-immune localized peak detector
+                    val detection = SimpleBlobDetector.detectNear(b, point)
+//                        RadialGradientAlignmentDetector.detectNear(b, point)
 
                     if (detection != null) {
-                        val corrected = Point2(detection.centre.x.toFloat(), detection.centre.y.toFloat())
+                        val corrected = Point2(detection.centre.x, detection.centre.y)
 
                         if (viewModel.mode == MeasureMode.JACK) {
                             viewModel.measurements.removeAll { it.name == "Jack" }
@@ -322,11 +338,10 @@ private fun BowlsMeasuringScreen(viewModel: BowlsViewModel) {
                             }
                         }
                     } else {
-                        viewModel.status = "Fit failed. Try tapping the clear edge of the bowl."
+                        viewModel.status = "Fit failed. Make sure to tap directly inside the body of the bowl."
                     }
                     viewModel.pendingCentre = null
-                }
-            }
+                }            }
         }
 
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
