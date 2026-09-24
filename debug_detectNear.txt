@@ -1,0 +1,33 @@
+WoodDetector (Near click)
+----------------------------
+Image: 1844 x 4000
+Click: (903, 1440)
+Working image: 472 x 1024
+
+Blur:
+  sigma = 12
+  min = 1.0
+  max = 253.0
+  mean = 141.1
+
+Candidate response:
+  min = 5.4
+  max = 1024.2
+  mean = 245.5
+  threshold = 24.0
+
+Candidate regions:
+  contours = 1126
+  after area filter = 83
+  candidate centres = 1
+
+Candidate 0:
+  centre = (226, 349)
+  initial radius = 31
+  radial points = 72
+  ellipse coverage = 1.00
+  aspect ratio = 0.99
+  radial consistency = 0.84
+  FINAL = accepted
+
+Final woods = 1

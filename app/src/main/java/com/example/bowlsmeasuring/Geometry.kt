@@ -11,7 +11,7 @@ data class PlaneModelResult(
     val focalLengthPx: Double
 )
 
-private data class Vec3(val x: Double, val y: Double, val z: Double) {
+public data class Vec3(val x: Double, val y: Double, val z: Double) {
     operator fun plus(other: Vec3) = Vec3(x + other.x, y + other.y, z + other.z)
     operator fun minus(other: Vec3) = Vec3(x - other.x, y - other.y, z - other.z)
     operator fun times(s: Double) = Vec3(x * s, y * s, z * s)

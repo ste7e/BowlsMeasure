@@ -15,7 +15,6 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
@@ -26,7 +25,6 @@ import androidx.compose.ui.unit.dp
 import android.graphics.Bitmap
 import androidx.activity.compose.setContent
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.nativeCanvas
@@ -37,11 +35,11 @@ import java.io.File
 import androidx.lifecycle.ViewModel
 import android.content.Context
 import android.graphics.BitmapFactory
+import androidx.compose.foundation.Image
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.setValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.core.net.toUri
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -67,6 +65,7 @@ class MainActivity : ComponentActivity() {
 }
 class BowlsViewModel : ViewModel() {
     var bitmap by mutableStateOf<Bitmap?>(null)
+    var debugStages by mutableStateOf<List<WoodDetector.ProcessingStage>?>(emptyList())
     var imageBitmap by mutableStateOf<ImageBitmap?>(null)
     val measurements = mutableStateListOf<ObjectMeasurement>()
     var mode by mutableStateOf(MeasureMode.NONE)
@@ -124,14 +123,14 @@ class BowlsViewModel : ViewModel() {
     fun updateFocalLengthFromExif(context: Context, uri: Uri) {
         try {
             context.contentResolver.openInputStream(uri)?.use { stream ->
-                val exif = android.media.ExifInterface(stream)
-                val focal35mm = exif.getAttributeInt(android.media.ExifInterface.TAG_FOCAL_LENGTH_IN_35MM_FILM, 0)
+                val exif = androidx.exifinterface.media.ExifInterface(stream)
+                val focal35mm = exif.getAttributeInt(androidx.exifinterface.media.ExifInterface.TAG_FOCAL_LENGTH_IN_35MM_FILM, 0)
 
                 if (focal35mm > 0) {
                     focalLength = (focal35mm.toFloat() * 1024f) / 36f
                     status = "Photo loaded. Auto-calibrated focal plane via EXIF (${focal35mm}mm equiv)."
                 } else {
-                    val focalPhysical = exif.getAttributeDouble(android.media.ExifInterface.TAG_FOCAL_LENGTH, 0.0)
+                    val focalPhysical = exif.getAttributeDouble(androidx.exifinterface.media.ExifInterface.TAG_FOCAL_LENGTH, 0.0)
                     if (focalPhysical > 0.0) {
                         val estimated35mm = focalPhysical * 6.0
                         focalLength = ((estimated35mm * 1024.0) / 36.0).toFloat()
@@ -144,28 +143,28 @@ class BowlsViewModel : ViewModel() {
             }
         } catch (e: Exception) {
             focalLength = 650f
-            status = "Photo loaded. Error accessing metadata headers, using baseline fallback."
+            status = "Photo loaded. Error accessing metadata headers, using baseline fallback. ${e.localizedMessage}"
         }
     }
 
     fun rotateBitmapIfRequired(context: Context, img: Bitmap, uri: Uri): Bitmap {
         return try {
             context.contentResolver.openInputStream(uri)?.use { stream ->
-                val exif = android.media.ExifInterface(stream)
+                val exif = androidx.exifinterface.media.ExifInterface(stream)
                 val orientation = exif.getAttributeInt(
-                    android.media.ExifInterface.TAG_ORIENTATION,
-                    android.media.ExifInterface.ORIENTATION_NORMAL
+                    androidx.exifinterface.media.ExifInterface.TAG_ORIENTATION,
+                    androidx.exifinterface.media.ExifInterface.ORIENTATION_NORMAL
                 )
                 val matrix = android.graphics.Matrix()
                 when (orientation) {
-                    android.media.ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
-                    android.media.ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
-                    android.media.ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
+                    androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
+                    androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
+                    androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
                     else -> return img
                 }
                 Bitmap.createBitmap(img, 0, 0, img.width, img.height, matrix, true)
             } ?: img
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             img
         }
     }
@@ -214,7 +213,7 @@ private fun BowlsMeasuringScreen(viewModel: BowlsViewModel) {
         if (success) {
             val savedUriStr = viewModel.highResPhotoUriString
             if (savedUriStr != null) {
-                viewModel.loadUri(context, Uri.parse(savedUriStr))
+                viewModel.loadUri(context, savedUriStr.toUri())
             } else {
                 viewModel.status = "Error: Photo taken successfully, but the file path anchor was lost."
             }
@@ -266,22 +265,32 @@ private fun BowlsMeasuringScreen(viewModel: BowlsViewModel) {
                 viewModel.status = "Detecting circular objects via Peak Distance Transform..."
                 scope.launch {
                     // 1. Execute our new peak blob detection pass
-                    val blobDetections =
+//                    val blobDetections =
                         //SimpleBlobDetector.detect(b)
                         //RadialGradientAlignmentDetector.detect(b)
                         //ContrastWoodDetector.detect(b)
-                        WoodDetector.detect(b)
+                    val result = WoodDetector.detectWithDebug(b)
+                    val blobDetections = result?.finalDetections
+
+//                    println(result?.candidates?.joinToString("\n") { it.toString() })
+                    viewModel.debugStages = result?.stages
+
 
                     // 2. Map the results cleanly over into your existing UI-compatible WoodDetection format
-                    viewModel.automaticDetections = blobDetections.map { blob ->
-                        // Map Point2 format directly across boundaries
-                        val cvPoint = org.opencv.core.Point(blob.centre.x.toDouble(), blob.centre.y.toDouble())
-                        WoodDetection(
-                            centre = cvPoint,
-                            radiusPx = blob.radiusPx,
-                            circularity = blob.solidity,
-                            confidence = blob.solidity
-                        )
+                    if (blobDetections != null) {
+                        viewModel.automaticDetections = blobDetections.map { blob ->
+                            // Map Point2 format directly across boundaries
+                            val cvPoint = org.opencv.core.Point(
+                                blob.centre.x,
+                                blob.centre.y
+                            )
+                            WoodDetection(
+                                centre = cvPoint,
+                                radiusPx = blob.radiusPx,
+                                circularity = blob.circularity,
+                                confidence = blob.confidence
+                            )
+                        }
                     }
 
                     viewModel.status = "Detected ${viewModel.automaticDetections.size} stable circular objects."
@@ -313,14 +322,17 @@ private fun BowlsMeasuringScreen(viewModel: BowlsViewModel) {
                     val b = viewModel.bitmap ?: return@launch
 
                     // 1. Invoke the new shadow-immune localized peak detector
-                    val detection =
+                    val detectionDebug =
                         //SimpleBlobDetector.detectNear(b, point)
                         //RadialGradientAlignmentDetector.detectNear(b, point)
-                        //ContrastWoodDetector.detectNear(b, point)
-                        WoodDetector.detectNear(b, point)
+//                        ContrastWoodDetector.detectNear(b, point)
+                        WoodDetector.detectNearWithDebug(b, point)
+
+                    val detection = detectionDebug?.finalDetections?.firstOrNull()
+                    viewModel.debugStages = detectionDebug?.stages
 
                     if (detection != null) {
-                        val corrected = Point2(detection.centre.x, detection.centre.y)
+                        val corrected = Point2(detection.centre.x.toFloat(), detection.centre.y.toFloat())
 
                         if (viewModel.mode == MeasureMode.JACK) {
                             viewModel.measurements.removeAll { it.name == "Jack" }
@@ -424,7 +436,9 @@ private fun BowlsMeasuringScreen(viewModel: BowlsViewModel) {
 
         Card(Modifier.fillMaxWidth()) {
             Row(
-                Modifier.fillMaxWidth().padding(12.dp),
+                Modifier
+                    .fillMaxWidth()
+                    .padding(12.dp),
                 verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
@@ -505,6 +519,15 @@ private fun BowlsMeasuringScreen(viewModel: BowlsViewModel) {
             }
         }
 
+        if (viewModel.debugStages != null) {
+            for (stage in viewModel.debugStages!!) {
+                Card(Modifier.fillMaxWidth()) {
+                    Text(stage.name, Modifier.padding(12.dp))
+                    stage.bitmap?.asImageBitmap()?.let { Image(bitmap = it, contentDescription = null) }
+                }
+            }
+        }
+
         if (viewModel.resultText.isNotBlank()) Card(Modifier.fillMaxWidth()) {
             Text(viewModel.resultText, Modifier.padding(12.dp))
         }
@@ -560,15 +583,15 @@ private fun MeasurementCanvas(
                 val pitchRad = Math.toRadians(cameraTilt.toDouble()).toFloat()
                 val cosP = kotlin.math.cos(pitchRad)
                 val sinP = kotlin.math.sin(pitchRad)
-                val H = 1.4f // Baseline standing camera height above the ground plane in meters
+                val heightOfCamera = 1.4f // Baseline standing camera height above the ground plane in meters
 
                 // Absolute vanishing point height determined strictly by physics
                 val vanishingPointY = centerH - f * (sinP / cosP)
 
                 // 3D Matrix ground projection transformer mapping world (X, Z) to Screen coordinates
                 val projectGroundPoint = { x: Float, z: Float ->
-                    val camY = -H * cosP + z * sinP
-                    val camZ = H * sinP + z * cosP
+                    val camY = -heightOfCamera * cosP + z * sinP
+                    val camZ = heightOfCamera * sinP + z * cosP
                     val screenX = centerW + (f * x / camZ)
                     val screenY = centerH - (f * camY / camZ)
                     Offset(screenX, screenY)
@@ -640,7 +663,7 @@ private fun MeasurementCanvas(
 
                 if (!alreadyMeasured) {
                     val centre = Offset((detection.centre.x * sx).toFloat(), (detection.centre.y * sy).toFloat())
-                    val radius = (detection.radiusPx * (sx + sy) / 2f).toFloat()
+                    val radius = (detection.radiusPx * (sx + sy) / 2f)
                     drawCircle(Color.Cyan, radius, centre, style = Stroke(2f))
 
                     val letterLabel = ('a' + index).toString()
