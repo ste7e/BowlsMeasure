@@ -208,62 +208,369 @@ object SimpleBlobDetector {
         }
     }
 
-    fun detect(bitmap: Bitmap): List<BlobDetection> {
+     fun detect(bitmap: Bitmap): List<BlobDetection> {
         val source = Mat()
         Utils.bitmapToMat(bitmap, source)
 
         val targetMaxDim = 1024.0
         val srcW = source.cols().toDouble()
         val srcH = source.rows().toDouble()
-        val scale = if (maxOf(srcW, srcH) > targetMaxDim) targetMaxDim / maxOf(srcW, srcH) else 1.0
+
+        val scale =
+            if (maxOf(srcW, srcH) > targetMaxDim)
+                targetMaxDim / maxOf(srcW, srcH)
+            else
+                1.0
 
         val working = Mat()
-        Imgproc.resize(source, working, Size(srcW * scale, srcH * scale))
-
-        val gray = Mat()
-        val blurred = Mat()
-        val binaryMask = Mat()
-        val hierarchy = Mat()
-        val contours = ArrayList<MatOfPoint>()
+        val rgb = Mat()
+        val woodMask = Mat()
+        val distMap = Mat()
+        val localMax = Mat()
+        val peakMask = Mat()
+        val radiusMask = Mat()
+        val labels = Mat()
+        val stats = Mat()
+        val centroids = Mat()
 
         try {
-            Imgproc.cvtColor(working, gray, Imgproc.COLOR_RGBA2GRAY)
+            // ------------------------------------------------------------
+            // 1. Work at a sensible maximum resolution.
+            // ------------------------------------------------------------
 
-            // Median blur is often better for grass "speckle" noise than Gaussian
-            Imgproc.medianBlur(gray, blurred, 5)
-
-            // ADAPTIVE THRESHOLD: Separates dark objects (woods) from grass locally.
-            // Adjust the '10.0' constant if it's picking up too much grass noise.
-            Imgproc.adaptiveThreshold(
-                blurred, binaryMask, 255.0,
-                Imgproc.ADAPTIVE_THRESH_GAUSSIAN_C,
-                Imgproc.THRESH_BINARY_INV, 51, 10.0
+            Imgproc.resize(
+                source,
+                working,
+                Size(srcW * scale, srcH * scale)
             )
 
-            // MORPHOLOGY: Remove tiny grass specks and fill small holes in the woods
-            val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, Size(5.0, 5.0))
-            Imgproc.morphologyEx(binaryMask, binaryMask, Imgproc.MORPH_OPEN, kernel)
-            Imgproc.morphologyEx(binaryMask, binaryMask, Imgproc.MORPH_CLOSE, kernel)
-            kernel.release()
+// ------------------------------------------------------------
+// 2. Identify the brown wood using colour.
+//
+// The woods in the photographs have a strong:
+//
+//     Red > Green > Blue
+//
+// relationship.
+//
+// This is considerably more discriminating than simply looking
+// for a particular HSV hue because the grass and bare soil can
+// also fall into the brown/yellow hue range.
+// ------------------------------------------------------------
 
-            Imgproc.findContours(
-                binaryMask,
-                contours,
-                hierarchy,
-                Imgproc.RETR_EXTERNAL,
-                Imgproc.CHAIN_APPROX_SIMPLE
+            Imgproc.cvtColor(
+                working,
+                rgb,
+                Imgproc.COLOR_RGBA2RGB
             )
 
-            // Process detections with correct area and scale mapping
-            return processContours(contours, scale, gray)
+            val channels = ArrayList<Mat>()
+            Core.split(rgb, channels)
+
+            val red = channels[0]
+            val green = channels[1]
+            val blue = channels[2]
+
+// red - green
+            val redGreenDifference = Mat()
+            Core.subtract(
+                red,
+                green,
+                redGreenDifference,
+                Mat(),
+                CvType.CV_16S
+            )
+
+// green - blue
+            val greenBlueDifference = Mat()
+            Core.subtract(
+                green,
+                blue,
+                greenBlueDifference,
+                Mat(),
+                CvType.CV_16S
+            )
+
+// Convert the differences into masks.
+//
+// The first threshold is the important one:
+//
+//     R - G > 15
+//
+// The second prevents strongly red/magenta pixels from being
+// treated as brown.
+//
+// We also require a minimum red value so that dark noise does
+// not become a candidate.
+            val redDominant = Mat()
+            Core.compare(
+                redGreenDifference,
+                Scalar(15.0),
+                redDominant,
+                Core.CMP_GT
+            )
+
+            val greenAboveBlue = Mat()
+            Core.compare(
+                greenBlueDifference,
+                Scalar(3.0),
+                greenAboveBlue,
+                Core.CMP_GT
+            )
+
+            val sufficientlyBright = Mat()
+            Core.compare(
+                red,
+                Scalar(50.0),
+                sufficientlyBright,
+                Core.CMP_GT
+            )
+
+            Core.bitwise_and(
+                redDominant,
+                greenAboveBlue,
+                woodMask
+            )
+
+            Core.bitwise_and(
+                woodMask,
+                sufficientlyBright,
+                woodMask
+            )
+
+            for (channel in channels) {
+                channel.release()
+            }
+
+            redGreenDifference.release()
+            greenBlueDifference.release()
+            redDominant.release()
+            greenAboveBlue.release()
+            sufficientlyBright.release()
+            rgb.release()
+
+            // ------------------------------------------------------------
+            // 3. Clean the colour mask.
+            //
+            // Opening removes small grass/soil specks.
+            // Closing fills small gaps caused by reflections on the wood.
+            // ------------------------------------------------------------
+
+            val openKernel = Imgproc.getStructuringElement(
+                Imgproc.MORPH_ELLIPSE,
+                Size(3.0, 3.0)
+            )
+
+            val closeKernel = Imgproc.getStructuringElement(
+                Imgproc.MORPH_ELLIPSE,
+                Size(9.0, 9.0)
+            )
+
+            try {
+                Imgproc.morphologyEx(
+                    woodMask,
+                    woodMask,
+                    Imgproc.MORPH_OPEN,
+                    openKernel
+                )
+
+                Imgproc.morphologyEx(
+                    woodMask,
+                    woodMask,
+                    Imgproc.MORPH_CLOSE,
+                    closeKernel
+                )
+            } finally {
+                openKernel.release()
+                closeKernel.release()
+            }
+
+            // ------------------------------------------------------------
+            // 4. Distance transform.
+            //
+            // Every foreground pixel gets its distance from the nearest
+            // background pixel.
+            //
+            // Therefore the maximum inside a wood should occur close to
+            // its centre, and the value is an estimate of its radius.
+            // ------------------------------------------------------------
+
+            Imgproc.distanceTransform(
+                woodMask,
+                distMap,
+                Geometry.DIST_L2,
+                5
+            )
+
+            // ------------------------------------------------------------
+            // 5. Find local maxima in the distance map.
+            //
+            // A 15x15 neighbourhood means we are looking for one peak
+            // per reasonably sized object rather than every pixel on a
+            // broad plateau.
+            // ------------------------------------------------------------
+
+            val peakKernel = Imgproc.getStructuringElement(
+                Imgproc.MORPH_ELLIPSE,
+                Size(15.0, 15.0)
+            )
+
+            try {
+                Imgproc.dilate(
+                    distMap,
+                    localMax,
+                    peakKernel
+                )
+            } finally {
+                peakKernel.release()
+            }
+
+            // Pixels which equal the local maximum are candidate centres.
+            Core.compare(
+                distMap,
+                localMax,
+                peakMask,
+                Core.CMP_EQ
+            )
+
+            // ------------------------------------------------------------
+            // 6. Ignore very small peaks.
+            //
+            // At our 1024px working resolution a real wood should have
+            // a distance-transform radius comfortably above a handful
+            // of pixels.
+            //
+            // We deliberately keep this fairly permissive for now.
+            // ------------------------------------------------------------
+
+            Core.inRange(
+                distMap,
+                Scalar(7.0),
+                Scalar(100.0),
+                radiusMask
+            )
+
+            Core.bitwise_and(
+                peakMask,
+                radiusMask,
+                peakMask
+            )
+
+            // ------------------------------------------------------------
+            // 7. Group neighbouring peak pixels.
+            //
+            // connectedComponentsWithStats gives us one component per
+            // local maximum and its centroid.
+            // ------------------------------------------------------------
+
+            val componentCount =
+                Imgproc.connectedComponentsWithStats(
+                    peakMask,
+                    labels,
+                    stats,
+                    centroids,
+                    8
+                )
+
+            val detections = mutableListOf<BlobDetection>()
+
+            for (label in 1 until componentCount) {
+                val cx = centroids.get(label, 0)[0]
+                val cy = centroids.get(label, 1)[0]
+
+                if (!cx.isFinite() || !cy.isFinite()) {
+                    continue
+                }
+
+                // --------------------------------------------------------
+                // Recover the actual distance-transform value at the
+                // detected centre.
+                // --------------------------------------------------------
+
+                val ix = cx.roundToInt()
+                    .coerceIn(0, distMap.cols() - 1)
+
+                val iy = cy.roundToInt()
+                    .coerceIn(0, distMap.rows() - 1)
+
+                val peakRadius = distMap
+                    .get(iy, ix)
+                    ?.firstOrNull()
+                    ?: continue
+
+                // ------------------------------------------------------------
+// Validate that this is a coherent brown object rather than
+// simply a brown patch in the grass.
+//
+// We compare the amount of brown inside the candidate against
+// the surrounding ring.
+//
+// A real wood should have:
+//   - lots of brown pixels inside
+//   - substantially less brown immediately outside
+// ------------------------------------------------------------
+
+                // Ignore tiny colour patches.
+                if (peakRadius < 4.0) {
+                    continue
+                }
+
+                // Ignore implausibly large regions.
+                if (peakRadius > 30.0) {
+                    continue
+                }
+
+                // --------------------------------------------------------
+                // Convert the centre and radius back to the original
+                // photograph's coordinate system.
+                // --------------------------------------------------------
+
+                val originalX = cx / scale
+                val originalY = cy / scale
+                val originalRadius = peakRadius / scale
+
+                detections.add(
+                    BlobDetection(
+                        centre = Point2(
+                            originalX.toFloat(),
+                            originalY.toFloat()
+                        ),
+                        radiusPx = originalRadius.toFloat(),
+                        areaPixels = (PI * originalRadius * originalRadius).toInt(),
+                        solidity = 0.9
+                    )
+                )
+            }
+
+            // ------------------------------------------------------------
+            // 8. Sort largest objects first.
+            //
+            // This is useful during development because if the colour
+            // mask produces a few unwanted small candidates, the real
+            // woods should normally be amongst the larger peaks.
+            // ------------------------------------------------------------
+
+            return detections
+                .sortedByDescending { it.radiusPx }
+                .take(4)
+
+        } catch (e: Exception) {
+            // Detection should fail cleanly rather than taking down
+            // the image-processing operation.
+            return emptyList()
 
         } finally {
             source.release()
             working.release()
-            gray.release()
-            blurred.release()
-            binaryMask.release()
-            hierarchy.release()
+            rgb.release()
+            woodMask.release()
+            distMap.release()
+            localMax.release()
+            peakMask.release()
+            radiusMask.release()
+            labels.release()
+            stats.release()
+            centroids.release()
         }
     }
 

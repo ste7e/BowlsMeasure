@@ -266,7 +266,11 @@ private fun BowlsMeasuringScreen(viewModel: BowlsViewModel) {
                 viewModel.status = "Detecting circular objects via Peak Distance Transform..."
                 scope.launch {
                     // 1. Execute our new peak blob detection pass
-                    val blobDetections = SimpleBlobDetector.detect(b)
+                    val blobDetections =
+                        //SimpleBlobDetector.detect(b)
+                        //RadialGradientAlignmentDetector.detect(b)
+                        //ContrastWoodDetector.detect(b)
+                        WoodDetector.detect(b)
 
                     // 2. Map the results cleanly over into your existing UI-compatible WoodDetection format
                     viewModel.automaticDetections = blobDetections.map { blob ->
@@ -309,8 +313,11 @@ private fun BowlsMeasuringScreen(viewModel: BowlsViewModel) {
                     val b = viewModel.bitmap ?: return@launch
 
                     // 1. Invoke the new shadow-immune localized peak detector
-                    val detection = SimpleBlobDetector.detectNear(b, point)
-//                        RadialGradientAlignmentDetector.detectNear(b, point)
+                    val detection =
+                        //SimpleBlobDetector.detectNear(b, point)
+                        //RadialGradientAlignmentDetector.detectNear(b, point)
+                        //ContrastWoodDetector.detectNear(b, point)
+                        WoodDetector.detectNear(b, point)
 
                     if (detection != null) {
                         val corrected = Point2(detection.centre.x, detection.centre.y)
