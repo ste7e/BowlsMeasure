@@ -259,6 +259,7 @@ private fun BowlsMeasuringScreen(viewModel: BowlsViewModel) {
         }
 
 // Inside MainActivity.kt -> Look for the "Detect Woods" Button click handler:
+        /*****************
         OutlinedButton(
             enabled = viewModel.bitmap != null,
             onClick = {
@@ -299,6 +300,7 @@ private fun BowlsMeasuringScreen(viewModel: BowlsViewModel) {
         ) {
             Text("Detect Woods")
         }
+        *******************/
 
         Text(viewModel.status, style = MaterialTheme.typography.bodySmall)
 
@@ -322,16 +324,11 @@ private fun BowlsMeasuringScreen(viewModel: BowlsViewModel) {
                     val b = viewModel.bitmap ?: return@launch
 
                     // 1. Invoke the new shadow-immune localized peak detector
-                    val detectionDebug =
+                    val detection =
                         //SimpleBlobDetector.detectNear(b, point)
                         //RadialGradientAlignmentDetector.detectNear(b, point)
 //                        ContrastWoodDetector.detectNear(b, point)
-                        WoodDetector.detectNearWithDebug(b, point)
-
-                    val detection = detectionDebug.detection
-
-                    viewModel.debugLines = detectionDebug.lines
-                    viewModel.debugImage = detectionDebug.debugImage
+                        ObjectDetector.detectNear(b, point)
 
 //                    viewModel.debugStages = detectionDebug?.stages
 
