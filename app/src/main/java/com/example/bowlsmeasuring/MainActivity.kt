@@ -65,7 +65,8 @@ class MainActivity : ComponentActivity() {
 }
 class BowlsViewModel : ViewModel() {
     var bitmap by mutableStateOf<Bitmap?>(null)
-    var debugStages by mutableStateOf<List<WoodDetector.ProcessingStage>?>(emptyList())
+    var debugLines by mutableStateOf<List<String>>(emptyList())
+    var debugImage by mutableStateOf<Bitmap?>(null)
     var imageBitmap by mutableStateOf<ImageBitmap?>(null)
     val measurements = mutableStateListOf<ObjectMeasurement>()
     var mode by mutableStateOf(MeasureMode.NONE)
@@ -74,7 +75,7 @@ class BowlsViewModel : ViewModel() {
     var resultText by mutableStateOf("")
     var jackRatio by mutableFloatStateOf(0.55f)
     var focalLength by mutableFloatStateOf(650f)
-    var automaticDetections by mutableStateOf<List<WoodDetection>>(emptyList())
+    var automaticDetections by mutableStateOf<List<BlobDetection>>(emptyList())
     var woodRankings by mutableStateOf<Map<String, Int>>(emptyMap())
     var showPerspectiveGrid by mutableStateOf(false)
     var radarPoints by mutableStateOf<List<RadarPoint>>(emptyList())
@@ -265,32 +266,31 @@ private fun BowlsMeasuringScreen(viewModel: BowlsViewModel) {
                 viewModel.status = "Detecting circular objects via Peak Distance Transform..."
                 scope.launch {
                     // 1. Execute our new peak blob detection pass
-//                    val blobDetections =
+                    val blobDetections =
                         //SimpleBlobDetector.detect(b)
                         //RadialGradientAlignmentDetector.detect(b)
                         //ContrastWoodDetector.detect(b)
-                    val result = WoodDetector.detectWithDebug(b)
-                    val blobDetections = result?.finalDetections
+                        WoodDetector.detect(b)
+//                    val result = WoodDetector.detectWithDebug(b)
+//                    val blobDetections = result?.finalDetections
 
 //                    println(result?.candidates?.joinToString("\n") { it.toString() })
-                    viewModel.debugStages = result?.stages
+//                    viewModel.debugStages = result?.stages
 
 
                     // 2. Map the results cleanly over into your existing UI-compatible WoodDetection format
-                    if (blobDetections != null) {
-                        viewModel.automaticDetections = blobDetections.map { blob ->
-                            // Map Point2 format directly across boundaries
-                            val cvPoint = org.opencv.core.Point(
-                                blob.centre.x,
-                                blob.centre.y
-                            )
-                            WoodDetection(
-                                centre = cvPoint,
-                                radiusPx = blob.radiusPx,
-                                circularity = blob.circularity,
-                                confidence = blob.confidence
-                            )
-                        }
+                    viewModel.automaticDetections = blobDetections.map { blob ->
+                        // Map Point2 format directly across boundaries
+                        val cvPoint = Point2(
+                            blob.centre.x,
+                            blob.centre.y
+                        )
+                        BlobDetection(
+                            centre = cvPoint,
+                            radiusPx = blob.radiusPx,
+                            areaPixels = blob.areaPixels,
+                            solidity = blob.solidity
+                        )
                     }
 
                     viewModel.status = "Detected ${viewModel.automaticDetections.size} stable circular objects."
@@ -328,11 +328,15 @@ private fun BowlsMeasuringScreen(viewModel: BowlsViewModel) {
 //                        ContrastWoodDetector.detectNear(b, point)
                         WoodDetector.detectNearWithDebug(b, point)
 
-                    val detection = detectionDebug?.finalDetections?.firstOrNull()
-                    viewModel.debugStages = detectionDebug?.stages
+                    val detection = detectionDebug.detection
+
+                    viewModel.debugLines = detectionDebug.lines
+                    viewModel.debugImage = detectionDebug.debugImage
+
+//                    viewModel.debugStages = detectionDebug?.stages
 
                     if (detection != null) {
-                        val corrected = Point2(detection.centre.x.toFloat(), detection.centre.y.toFloat())
+                        val corrected = Point2(detection.centre.x, detection.centre.y)
 
                         if (viewModel.mode == MeasureMode.JACK) {
                             viewModel.measurements.removeAll { it.name == "Jack" }
@@ -360,7 +364,8 @@ private fun BowlsMeasuringScreen(viewModel: BowlsViewModel) {
                         viewModel.status = "Fit failed. Make sure to tap directly inside the body of the bowl."
                     }
                     viewModel.pendingCentre = null
-                }            }
+                }
+            }
         }
 
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -519,6 +524,29 @@ private fun BowlsMeasuringScreen(viewModel: BowlsViewModel) {
             }
         }
 
+        if (viewModel.debugLines.isNotEmpty()) {
+            OutlinedButton(
+                modifier = Modifier.fillMaxWidth(),
+                onClick = {
+                    try {
+                        val debugFile = File(context.getExternalFilesDir(null), "debug_detectNear.txt")
+                        debugFile.writeText(viewModel.debugLines.joinToString("\n"))
+                        viewModel.status = "Debug log dumped to: ${debugFile.absolutePath}"
+                    } catch (e: Exception) {
+                        viewModel.status = "Failed to dump debug lines: ${e.message}"
+                    }
+                }
+            ) {
+                Text("Dump Debug Lines to File")
+            }
+        }
+        Card(Modifier.fillMaxWidth()) {
+            viewModel.debugImage?.asImageBitmap()?.let { Image(bitmap = it, contentDescription = null) }
+//            for (line in viewModel.debugLines) {
+//                Text(line)
+//            }
+        }
+/*
         if (viewModel.debugStages != null) {
             for (stage in viewModel.debugStages!!) {
                 Card(Modifier.fillMaxWidth()) {
@@ -527,6 +555,7 @@ private fun BowlsMeasuringScreen(viewModel: BowlsViewModel) {
                 }
             }
         }
+*/
 
         if (viewModel.resultText.isNotBlank()) Card(Modifier.fillMaxWidth()) {
             Text(viewModel.resultText, Modifier.padding(12.dp))
@@ -539,7 +568,7 @@ private fun BowlsMeasuringScreen(viewModel: BowlsViewModel) {
 private fun MeasurementCanvas(
     image: ImageBitmap,
     measurements: List<ObjectMeasurement>,
-    detections: List<WoodDetection>,
+    detections: List<BlobDetection>,
     pendingCentre: Point2?,
     rankings: Map<String, Int>,
     showGrid: Boolean,
@@ -662,7 +691,7 @@ private fun MeasurementCanvas(
                 }
 
                 if (!alreadyMeasured) {
-                    val centre = Offset((detection.centre.x * sx).toFloat(), (detection.centre.y * sy).toFloat())
+                    val centre = Offset((detection.centre.x * sx), (detection.centre.y * sy))
                     val radius = (detection.radiusPx * (sx + sy) / 2f)
                     drawCircle(Color.Cyan, radius, centre, style = Stroke(2f))
 

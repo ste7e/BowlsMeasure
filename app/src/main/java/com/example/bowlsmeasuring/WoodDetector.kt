@@ -5,6 +5,7 @@ import org.opencv.android.Utils
 import org.opencv.core.*
 import org.opencv.geometry.Geometry
 import org.opencv.imgproc.Imgproc
+import java.util.Locale
 import kotlin.math.*
 
 /**
@@ -31,21 +32,8 @@ import kotlin.math.*
  */
 object WoodDetector {
 
-    /*
-     * Maximum dimension used during candidate generation.
-     *
-     * The original image is retained separately for final boundary
-     * refinement.
-     */
     private const val TARGET_MAX_DIM = 1024.0
 
-    /*
-     * Heavy blur scales.
-     *
-     * These are deliberately much stronger than the small blur used
-     * by the previous detector. Their purpose is to make grass texture
-     * disappear while retaining objects the size of woods.
-     */
     private val BLUR_SIGMAS =
         doubleArrayOf(
             8.0,
@@ -54,10 +42,6 @@ object WoodDetector {
             20.0
         )
 
-    /*
-     * Gaussian kernel sizes corresponding approximately to the
-     * sigma values above.
-     */
     private val BLUR_KERNELS =
         intArrayOf(
             31,
@@ -66,74 +50,52 @@ object WoodDetector {
             81
         )
 
-    /*
-     * Candidate response threshold.
-     *
-     * This is deliberately fairly low because candidate generation
-     * is only the first stage.
-     */
     private const val MIN_CANDIDATE_RESPONSE = 7.0
 
-    /*
-     * Number of candidate centres retained before detailed analysis.
-     */
     private const val MAX_CENTRES = 30
 
-    /*
-     * Approximate minimum/maximum wood diameter in working pixels.
-     *
-     * These are deliberately broad because camera distance varies.
-     */
     private const val MIN_DIAMETER = 24.0
     private const val MAX_DIAMETER = 180.0
 
-    /*
-     * Number of radial samples used to find the boundary.
-     */
     private const val RADIAL_SAMPLES = 72
 
-    /*
-     * Angular sampling step in radians.
-     */
     private const val TWO_PI = 2.0 * PI
 
-    /*
-     * Minimum and maximum fraction of the estimated radius at which
-     * an edge is allowed to occur.
-     */
     private const val MIN_EDGE_RADIUS_FRACTION = 0.45
     private const val MAX_EDGE_RADIUS_FRACTION = 1.60
 
-    /*
-     * Minimum boundary-gradient strength.
-     */
     private const val MIN_EDGE_STRENGTH = 7.0
 
-    /*
-     * Minimum number of successful radial edge measurements required
-     * to fit an ellipse.
-     */
     private const val MIN_BOUNDARY_POINTS = 28
 
-    /*
-     * Maximum number of returned woods.
-     */
     private const val MAX_DETECTIONS = 4
 
-    /*
-     * Local search size for detectNear().
-     */
     private const val NEAR_ROI_SIZE = 360
 
-    /*
-     * Minimum score for a refined candidate.
-     */
     private const val MIN_FINAL_SCORE = 0.28
 
-    /*
-     * Radius used to suppress duplicate detections.
-     */
     private const val DUPLICATE_DISTANCE_FACTOR = 0.65
+
+    /**
+     * Result returned by detectNearWithDebug().
+     *
+     * debugImage is in ORIGINAL bitmap coordinates.
+     */
+    data class DebugResult(
+        val detection: BlobDetection?,
+        val lines: List<String>,
+        val debugImage: Bitmap?
+    )
+
+    /**
+     * Information retained for each radial boundary sample.
+     */
+    private data class RadialDebugPoint(
+        val angleDegrees: Double,
+        val radius: Double,
+        val gradient: Double,
+        val point: Point
+    )
 
     /**
      * Fully automatic detection.
@@ -169,21 +131,11 @@ object WoodDetector {
 
             try {
 
-                /*
-                 * Candidate generation operates on the heavily blurred
-                 * working image.
-                 */
                 val centres =
                     findCandidateCentres(
                         working
                     )
 
-                /*
-                 * Refinement uses the original image.
-                 *
-                 * We pass the original image, together with the scale
-                 * used for the candidate centres.
-                 */
                 val candidates =
                     centres.mapNotNull { centre ->
 
@@ -250,12 +202,10 @@ object WoodDetector {
             try {
 
                 val clickX =
-                    clickedPoint.x *
-                            scale
+                    clickedPoint.x * scale
 
                 val clickY =
-                    clickedPoint.y *
-                            scale
+                    clickedPoint.y * scale
 
                 val half =
                     NEAR_ROI_SIZE / 2
@@ -264,8 +214,7 @@ object WoodDetector {
                     maxOf(
                         0,
                         (
-                                clickX -
-                                        half
+                                clickX - half
                                 ).roundToInt()
                     )
 
@@ -273,23 +222,20 @@ object WoodDetector {
                     maxOf(
                         0,
                         (
-                                clickY -
-                                        half
+                                clickY - half
                                 ).roundToInt()
                     )
 
                 val ex =
                     minOf(
                         working.cols(),
-                        sx +
-                                NEAR_ROI_SIZE
+                        sx + NEAR_ROI_SIZE
                     )
 
                 val ey =
                     minOf(
                         working.rows(),
-                        sy +
-                                NEAR_ROI_SIZE
+                        sy + NEAR_ROI_SIZE
                     )
 
                 val width =
@@ -305,9 +251,6 @@ object WoodDetector {
                     return null
                 }
 
-                /*
-                 * Candidate generation happens in the ROI.
-                 */
                 val roi =
                     working.submat(
                         Rect(
@@ -320,43 +263,26 @@ object WoodDetector {
 
                 try {
 
-                    val localClick =
-                        Point(
-                            clickX - sx,
-                            clickY - sy
-                        )
-
                     val centres =
                         findCandidateCentres(
                             roi
                         )
 
-                    /*
-                     * Convert ROI-local candidate centres to original
-                     * image coordinates before refinement.
-                     */
                     val candidates =
                         centres.mapNotNull { centre ->
 
                             val workingX =
-                                centre.x +
-                                        sx
+                                centre.x + sx
 
                             val workingY =
-                                centre.y +
-                                        sy
+                                centre.y + sy
 
                             refineCandidate(
                                 original = source,
-
                                 candidateX =
-                                    workingX /
-                                            scale,
-
+                                    workingX / scale,
                                 candidateY =
-                                    workingY /
-                                            scale,
-
+                                    workingY / scale,
                                 workingScale =
                                     scale
                             )
@@ -368,11 +294,6 @@ object WoodDetector {
                         return null
                     }
 
-                    /*
-                     * In near mode proximity to the tap is deliberately
-                     * strong, but the candidate still has to look like
-                     * a wood.
-                     */
                     return candidates
                         .minByOrNull { candidate ->
 
@@ -394,12 +315,8 @@ object WoodDetector {
                                             dy * dy
                                 )
 
-                            /*
-                             * Score is used as a secondary term.
-                             */
                             distance -
-                                    candidate.score *
-                                    20.0
+                                    candidate.score * 20.0
                         }
                         ?.detection
 
@@ -421,29 +338,379 @@ object WoodDetector {
     }
 
     /**
+     * Debug version of detectNear().
+     *
+     * The detection algorithm is deliberately the same as detectNear().
+     *
+     * In addition, this returns:
+     *
+     *   - detailed radial measurements
+     *   - candidate measurements
+     *   - a debug image showing the selected radial points
+     *
+     * The debug image uses ORIGINAL bitmap coordinates.
+     */
+    fun detectNearWithDebug(
+        bitmap: Bitmap,
+        clickedPoint: Point2
+    ): DebugResult {
+
+        val lines =
+            mutableListOf<String>()
+
+        lines +=
+            "WoodDetector (Near click)"
+        lines +=
+            "----------------------------"
+        lines +=
+            "Image: ${bitmap.width} x ${bitmap.height}"
+        lines +=
+            String.format(
+                Locale.US,
+                "Click: (%.1f, %.1f)",
+                clickedPoint.x,
+                clickedPoint.y
+            )
+
+        val source = Mat()
+
+        Utils.bitmapToMat(
+            bitmap,
+            source
+        )
+
+        if (source.empty()) {
+
+            lines += "Source image is empty."
+
+            return DebugResult(
+                detection = null,
+                lines = lines,
+                debugImage = null
+            )
+        }
+
+        /*
+         * Work on a colour copy so that the debug annotations can be
+         * drawn over the original photograph.
+         */
+        val debugMat =
+            source.clone()
+
+        try {
+
+            val scale =
+                calculateScale(source)
+
+            val working =
+                resizeForDetection(
+                    source,
+                    scale
+                )
+
+            try {
+
+                lines +=
+                    "Working image: " +
+                            "${working.cols()} x ${working.rows()}"
+
+                lines += ""
+
+                /*
+                 * Generate the same ROI as detectNear().
+                 */
+                val clickX =
+                    clickedPoint.x * scale
+
+                val clickY =
+                    clickedPoint.y * scale
+
+                val half =
+                    NEAR_ROI_SIZE / 2
+
+                val sx =
+                    maxOf(
+                        0,
+                        (
+                                clickX - half
+                                ).roundToInt()
+                    )
+
+                val sy =
+                    maxOf(
+                        0,
+                        (
+                                clickY - half
+                                ).roundToInt()
+                    )
+
+                val ex =
+                    minOf(
+                        working.cols(),
+                        sx + NEAR_ROI_SIZE
+                    )
+
+                val ey =
+                    minOf(
+                        working.rows(),
+                        sy + NEAR_ROI_SIZE
+                    )
+
+                val width =
+                    ex - sx
+
+                val height =
+                    ey - sy
+
+                if (
+                    width < 40 ||
+                    height < 40
+                ) {
+
+                    lines +=
+                        "ROI too small."
+
+                    return DebugResult(
+                        detection = null,
+                        lines = lines,
+                        debugImage =
+                            matToBitmap(debugMat)
+                    )
+                }
+
+                val roi =
+                    working.submat(
+                        Rect(
+                            sx,
+                            sy,
+                            width,
+                            height
+                        )
+                    )
+
+                try {
+
+                    lines +=
+                        "ROI: x=$sx y=$sy " +
+                                "width=$width height=$height"
+
+                    lines += ""
+
+                    /*
+                     * Candidate generation diagnostics.
+                     */
+                    val candidateDebug =
+                        CandidateDebug()
+
+                    val centres =
+                        findCandidateCentres(
+                            roi,
+                            candidateDebug
+                        )
+
+                    lines +=
+                        "Candidate regions:"
+                    lines +=
+                        "  contours = " +
+                                candidateDebug.contours
+                    lines +=
+                        "  after area filter = " +
+                                candidateDebug.afterAreaFilter
+                    lines +=
+                        "  candidate centres = " +
+                                centres.size
+
+                    lines += ""
+
+                    if (
+                        centres.isEmpty()
+                    ) {
+
+                        lines +=
+                            "No candidate centres."
+
+                        drawClickedPoint(
+                            debugMat,
+                            clickedPoint
+                        )
+
+                        return DebugResult(
+                            detection = null,
+                            lines = lines,
+                            debugImage =
+                                matToBitmap(debugMat)
+                        )
+                    }
+
+                    val candidates =
+                        mutableListOf<RefinedCandidate>()
+
+                    centres.forEachIndexed { index, centre ->
+
+                        val workingX =
+                            centre.x + sx
+
+                        val workingY =
+                            centre.y + sy
+
+                        val candidateX =
+                            workingX / scale
+
+                        val candidateY =
+                            workingY / scale
+
+                        val candidateResult =
+                            refineCandidate(
+                                original = source,
+                                candidateX =
+                                    candidateX,
+                                candidateY =
+                                    candidateY,
+                                workingScale =
+                                    scale,
+                                debugLines =
+                                    lines,
+                                candidateIndex =
+                                    index,
+                                debugMat =
+                                    debugMat
+                            )
+
+                        if (
+                            candidateResult != null
+                        ) {
+                            candidates +=
+                                candidateResult
+                        }
+                    }
+
+                    lines += ""
+                    lines +=
+                        "Refined candidates = " +
+                                candidates.size
+
+                    if (
+                        candidates.isEmpty()
+                    ) {
+
+                        lines +=
+                            "Final woods = 0"
+
+                        drawClickedPoint(
+                            debugMat,
+                            clickedPoint
+                        )
+
+                        return DebugResult(
+                            detection = null,
+                            lines = lines,
+                            debugImage =
+                                matToBitmap(debugMat)
+                        )
+                    }
+
+                    val selected =
+                        candidates
+                            .minByOrNull { candidate ->
+
+                                val dx =
+                                    candidate.detection
+                                        .centre
+                                        .x -
+                                            clickedPoint.x
+
+                                val dy =
+                                    candidate.detection
+                                        .centre
+                                        .y -
+                                            clickedPoint.y
+
+                                val distance =
+                                    sqrt(
+                                        dx * dx +
+                                                dy * dy
+                                    )
+
+                                distance -
+                                        candidate.score * 20.0
+                            }
+
+                    drawClickedPoint(
+                        debugMat,
+                        clickedPoint
+                    )
+
+                    if (
+                        selected != null
+                    ) {
+
+                        drawSelectedCandidate(
+                            debugMat,
+                            selected
+                        )
+
+                        lines +=
+                            "Final woods = 1"
+                    } else {
+
+                        lines +=
+                            "Final woods = 0"
+                    }
+
+                    return DebugResult(
+                        detection =
+                            selected?.detection,
+                        lines = lines,
+                        debugImage =
+                            matToBitmap(debugMat)
+                    )
+
+                } finally {
+                    roi.release()
+                }
+
+            } finally {
+                working.release()
+            }
+
+        } catch (e: Exception) {
+
+            lines += ""
+            lines +=
+                "EXCEPTION: " +
+                        (e.message ?: e.javaClass.simpleName)
+
+            return DebugResult(
+                detection = null,
+                lines = lines,
+                debugImage =
+                    matToBitmap(debugMat)
+            )
+
+        } finally {
+
+            debugMat.release()
+            source.release()
+        }
+    }
+
+    /**
      * Candidate generation.
-     *
-     * This is intentionally NOT trying to find the edge of the wood.
-     *
-     * It only asks:
-     *
-     *   "Where are there large-scale image structures that could
-     *    plausibly be a wood-sized object?"
-     *
-     * The original image is used later to determine the boundary.
      */
     private fun findCandidateCentres(
-        source: Mat
+        source: Mat,
+        debug: CandidateDebug? = null
     ): List<Point> {
 
-        val gray =
-            Mat()
+        val gray = Mat()
 
-        val response =
+        val response = Mat()
+
+        val zeros =
             Mat.zeros(
                 source.rows(),
                 source.cols(),
-                CvType.CV_32F
+                CvType.CV_8U
             )
 
         try {
@@ -453,9 +720,6 @@ object WoodDetector {
                 gray
             )
 
-            /*
-             * A little initial smoothing removes sensor-level noise.
-             */
             Imgproc.GaussianBlur(
                 gray,
                 gray,
@@ -466,21 +730,13 @@ object WoodDetector {
                 1.5
             )
 
-            /*
-             * Accumulate the strongest large-scale response.
-             */
             for (
             index in BLUR_SIGMAS.indices
             ) {
 
-                val blurred =
-                    Mat()
-
-                val localBackground =
-                    Mat()
-
-                val localResponse =
-                    Mat()
+                val blurred = Mat()
+                val localBackground = Mat()
+                val localResponse = Mat()
 
                 try {
 
@@ -497,19 +753,12 @@ object WoodDetector {
                         BLUR_SIGMAS[index]
                     )
 
-                    /*
-                     * Difference between a moderately smoothed image
-                     * and a much more heavily smoothed image.
-                     *
-                     * This suppresses fine grass texture.
-                     */
                     Imgproc.GaussianBlur(
                         blurred,
                         localBackground,
                         Size(
                             (
-                                    kernel *
-                                            1.7
+                                    kernel * 1.7
                                     ).toInt()
                                 .coerceAtLeast(3)
                                 .let {
@@ -519,10 +768,8 @@ object WoodDetector {
                                         it.toDouble()
                                     }
                                 },
-
                             (
-                                    kernel *
-                                            1.7
+                                    kernel * 1.7
                                     ).toInt()
                                 .coerceAtLeast(3)
                                 .let {
@@ -533,8 +780,7 @@ object WoodDetector {
                                     }
                                 }
                         ),
-                        BLUR_SIGMAS[index] *
-                                1.7
+                        BLUR_SIGMAS[index] * 1.7
                     )
 
                     Core.absdiff(
@@ -543,11 +789,8 @@ object WoodDetector {
                         localResponse
                     )
 
-                    /*
-                     * Keep the strongest response seen at each pixel.
-                     */
                     Core.max(
-                        response,
+                        zeros,
                         localResponse,
                         response
                     )
@@ -560,9 +803,18 @@ object WoodDetector {
                 }
             }
 
-            /*
-             * Suppress tiny local maxima.
-             */
+            val responseMinMax =
+                Core.minMaxLoc(response)
+
+            if (debug != null) {
+                debug.responseMin =
+                    responseMinMax.minVal
+                debug.responseMax =
+                    responseMinMax.maxVal
+                debug.responseMean =
+                    Core.mean(response).`val`[0]
+            }
+
             val peakKernel =
                 Imgproc.getStructuringElement(
                     Imgproc.MORPH_ELLIPSE,
@@ -572,11 +824,8 @@ object WoodDetector {
                     )
                 )
 
-            val localMax =
-                Mat()
-
-            val peakMask =
-                Mat()
+            val localMax = Mat()
+            val peakMask = Mat()
 
             try {
 
@@ -593,9 +842,6 @@ object WoodDetector {
                     Core.CMP_EQ
                 )
 
-                /*
-                 * Threshold the response.
-                 */
                 val thresholdMask =
                     Mat()
 
@@ -624,85 +870,95 @@ object WoodDetector {
                     thresholdMask.release()
                 }
 
+                val contours =
+                    ArrayList<MatOfPoint>()
+
+                val hierarchy =
+                    Mat()
+
+                try {
+
+                    Imgproc.findContours(
+                        peakMask,
+                        contours,
+                        hierarchy,
+                        Imgproc.RETR_EXTERNAL,
+                        Imgproc.CHAIN_APPROX_SIMPLE
+                    )
+
+                    if (debug != null) {
+                        debug.contours =
+                            contours.size
+
+                        /*
+                         * This is the number that the existing
+                         * implementation effectively retains before
+                         * returning candidate centres.
+                         */
+                        debug.afterAreaFilter =
+                            contours.size
+                    }
+
+                    return contours
+                        .mapNotNull { contour ->
+
+                            val moments =
+                                Geometry.moments(
+                                    contour
+                                )
+
+                            if (
+                                abs(moments.m00) <
+                                1e-9
+                            ) {
+                                null
+                            } else {
+
+                                Point(
+                                    moments.m10 /
+                                            moments.m00,
+
+                                    moments.m01 /
+                                            moments.m00
+                                )
+                            }
+                        }
+                        .sortedByDescending { point ->
+
+                            response
+                                .get(
+                                    point.y
+                                        .roundToInt()
+                                        .coerceIn(
+                                            0,
+                                            response.rows() - 1
+                                        ),
+
+                                    point.x
+                                        .roundToInt()
+                                        .coerceIn(
+                                            0,
+                                            response.cols() - 1
+                                        )
+                                )
+                                ?.firstOrNull()
+                                ?: 0.0
+                        }
+                        .take(MAX_CENTRES)
+
+                } finally {
+
+                    hierarchy.release()
+
+                    contours.forEach {
+                        it.release()
+                    }
+                }
+
             } finally {
 
                 peakKernel.release()
                 localMax.release()
-            }
-
-            /*
-             * Extract the strongest peak locations.
-             */
-            val contours =
-                ArrayList<MatOfPoint>()
-
-            val hierarchy =
-                Mat()
-
-            try {
-
-                Imgproc.findContours(
-                    peakMask,
-                    contours,
-                    hierarchy,
-                    Imgproc.RETR_EXTERNAL,
-                    Imgproc.CHAIN_APPROX_SIMPLE
-                )
-
-                return contours
-                    .mapNotNull { contour ->
-
-                        val moments =
-                            Geometry.moments(
-                                contour
-                            )
-
-                        if (
-                            abs(moments.m00) <
-                            1e-9
-                        ) {
-                            null
-                        } else {
-
-                            Point(
-                                moments.m10 /
-                                        moments.m00,
-
-                                moments.m01 /
-                                        moments.m00
-                            )
-                        }
-                    }
-                    .sortedByDescending { point ->
-
-                        response
-                            .get(
-                                point.y
-                                    .roundToInt()
-                                    .coerceIn(
-                                        0,
-                                        response.rows() - 1
-                                    ),
-
-                                point.x
-                                    .roundToInt()
-                                    .coerceIn(
-                                        0,
-                                        response.cols() - 1
-                                    )
-                            )
-                            ?.firstOrNull()
-                            ?: 0.0
-                    }
-                    .take(MAX_CENTRES)
-
-            } finally {
-
-                hierarchy.release()
-
-                contours.forEach {
-                    it.release()
-                }
             }
 
         } finally {
@@ -715,13 +971,16 @@ object WoodDetector {
     /**
      * Refine one candidate using the ORIGINAL image.
      *
-     * This is the important second stage.
+     * Optional debug arguments do not alter the detection itself.
      */
     private fun refineCandidate(
         original: Mat,
         candidateX: Double,
         candidateY: Double,
-        workingScale: Double
+        workingScale: Double,
+        debugLines: MutableList<String>? = null,
+        candidateIndex: Int = -1,
+        debugMat: Mat? = null
     ): RefinedCandidate? {
 
         if (
@@ -733,8 +992,7 @@ object WoodDetector {
             return null
         }
 
-        val gray =
-            Mat()
+        val gray = Mat()
 
         try {
 
@@ -743,11 +1001,6 @@ object WoodDetector {
                 gray
             )
 
-            /*
-             * We don't need to process the whole original image.
-             *
-             * Work in a local window around the candidate.
-             */
             val expectedRadius =
                 estimateInitialRadius(
                     original,
@@ -758,32 +1011,28 @@ object WoodDetector {
 
             val searchRadius =
                 (
-                        expectedRadius *
-                                1.8
+                        expectedRadius * 1.8
                         )
                     .roundToInt()
                     .coerceAtLeast(30)
 
             val sx =
                 (
-                        candidateX -
-                                searchRadius
+                        candidateX - searchRadius
                         )
                     .roundToInt()
                     .coerceAtLeast(0)
 
             val sy =
                 (
-                        candidateY -
-                                searchRadius
+                        candidateY - searchRadius
                         )
                     .roundToInt()
                     .coerceAtLeast(0)
 
             val ex =
                 (
-                        candidateX +
-                                searchRadius
+                        candidateX + searchRadius
                         )
                     .roundToInt()
                     .coerceAtMost(
@@ -792,8 +1041,7 @@ object WoodDetector {
 
             val ey =
                 (
-                        candidateY +
-                                searchRadius
+                        candidateY + searchRadius
                         )
                     .roundToInt()
                     .coerceAtMost(
@@ -831,11 +1079,6 @@ object WoodDetector {
                         candidateY - sy
                     )
 
-                /*
-                 * Light smoothing ONLY for edge measurement.
-                 *
-                 * We deliberately do not apply the huge blur here.
-                 */
                 val smoothed =
                     Mat()
 
@@ -856,9 +1099,30 @@ object WoodDetector {
                             image = smoothed,
                             centre = localCentre,
                             expectedRadius =
-                                expectedRadius
+                                expectedRadius,
+                            debugLines =
+                                debugLines,
+                            candidateIndex =
+                                candidateIndex
                         )
                             ?: return null
+
+                    /*
+                     * Draw the actual selected radial points on the
+                     * ORIGINAL image.
+                     */
+                    if (
+                        debugMat != null &&
+                        boundary.radialDebugPoints != null
+                    ) {
+
+                        drawRadialDebugPoints(
+                            debugMat,
+                            boundary.radialDebugPoints,
+                            sx,
+                            sy
+                        )
+                    }
 
                     val ellipse =
                         fitBoundaryEllipse(
@@ -866,11 +1130,6 @@ object WoodDetector {
                         )
                             ?: return null
 
-                    /*
-                     * Convert ellipse dimensions back to original
-                     * image coordinates. We are already in original
-                     * image pixels here, so no scale is required.
-                     */
                     val major =
                         maxOf(
                             ellipse.size.width,
@@ -891,17 +1150,11 @@ object WoodDetector {
                     }
 
                     val aspect =
-                        minor /
-                                major
+                        minor / major
 
-                    /*
-                     * The candidate's apparent radius is the geometric
-                     * mean of the fitted ellipse axes.
-                     */
                     val radius =
                         sqrt(
-                            major *
-                                    minor
+                            major * minor
                         ) / 2.0
 
                     if (
@@ -911,39 +1164,21 @@ object WoodDetector {
                         return null
                     }
 
-                    /*
-                     * How consistently do the measured boundary points
-                     * lie on the fitted ellipse?
-                     */
                     val fitScore =
                         ellipseFitScore(
                             boundary.points,
                             ellipse
                         )
 
-                    /*
-                     * How complete is the detected boundary?
-                     */
                     val coverageScore =
                         boundary.coverage
 
-                    /*
-                     * How consistent are the radial distances?
-                     *
-                     * A shadow generally produces a highly asymmetric
-                     * distribution of edge distances.
-                     */
                     val radialConsistency =
                         radialConsistencyScore(
                             boundary.points,
                             ellipse
                         )
 
-                    /*
-                     * Compactness/shape score.
-                     *
-                     * We allow substantial perspective distortion.
-                     */
                     val shapeScore =
                         (
                                 0.40 *
@@ -968,9 +1203,6 @@ object WoodDetector {
                         return null
                     }
 
-                    /*
-                     * Boundary gradient strength.
-                     */
                     val edgeScore =
                         (
                                 boundary.meanStrength /
@@ -981,71 +1213,194 @@ object WoodDetector {
                                 1.0
                             )
 
-                    /*
-                     * Final candidate score.
-                     *
-                     * Geometry is deliberately the dominant signal.
-                     */
                     val score =
-                        0.50 *
-                                shapeScore +
-                                0.25 *
-                                coverageScore +
-                                0.15 *
-                                edgeScore +
-                                0.10 *
-                                fitScore
+                        0.50 * shapeScore +
+                                0.25 * coverageScore +
+                                0.15 * edgeScore +
+                                0.10 * fitScore
 
-                    /*
-                     * Convert local ellipse centre back to complete
-                     * original-image coordinates.
-                     */
                     val centreX =
-                        ellipse.center.x +
-                                sx
+                        ellipse.center.x + sx
 
                     val centreY =
-                        ellipse.center.y +
-                                sy
+                        ellipse.center.y + sy
 
-                    return RefinedCandidate(
+                    val result =
+                        RefinedCandidate(
 
-                        detection =
-                            BlobDetection(
-                                centre =
-                                    Point2(
-                                        centreX
-                                            .toFloat(),
+                            detection =
+                                BlobDetection(
+                                    centre =
+                                        Point2(
+                                            centreX.toFloat(),
+                                            centreY.toFloat()
+                                        ),
 
-                                        centreY
-                                            .toFloat()
-                                    ),
+                                    radiusPx =
+                                        radius.toFloat(),
 
-                                radiusPx =
-                                    radius.toFloat(),
+                                    areaPixels =
+                                        (
+                                                PI *
+                                                        radius *
+                                                        radius
+                                                )
+                                            .roundToInt(),
 
-                                areaPixels =
-                                    (
-                                            PI *
-                                                    radius *
-                                                    radius
-                                            )
-                                        .roundToInt(),
+                                    solidity =
+                                        shapeScore
+                                ),
 
-                                solidity =
-                                    shapeScore
+                            score = score,
+
+                            radius = radius,
+
+                            aspectRatio = aspect,
+
+                            fitScore = fitScore,
+
+                            coverage = coverageScore
+                        )
+
+                    if (
+                        debugLines != null
+                    ) {
+
+                        debugLines +=
+                            "Candidate $candidateIndex:"
+
+                        debugLines +=
+                            String.format(
+                                Locale.US,
+                                "  centre working = (%.1f, %.1f)",
+                                candidateX *
+                                        workingScale,
+                                candidateY *
+                                        workingScale
+                            )
+
+                        debugLines +=
+                            String.format(
+                                Locale.US,
+                                "  centre original = (%.1f, %.1f)",
+                                candidateX,
+                                candidateY
+                            )
+
+                        debugLines +=
+                            String.format(
+                                Locale.US,
+                                "  initial radius = %.1f",
+                                expectedRadius
+                            )
+
+                        debugLines +=
+                            "  radial points = " +
+                                    boundary.points.size
+
+                        debugLines +=
+                            String.format(
+                                Locale.US,
+                                "  radius: min=%.1f max=%.1f mean=%.1f median=%.1f",
+                                boundary.radialMin,
+                                boundary.radialMax,
+                                boundary.radialMean,
+                                boundary.radialMedian
+                            )
+
+                        debugLines +=
+                            String.format(
+                                Locale.US,
+                                "  ellipse coverage = %.2f",
+                                coverageScore
+                            )
+
+                        debugLines +=
+                            String.format(
+                                Locale.US,
+                                "  aspect ratio = %.2f",
+                                aspect
+                            )
+
+                        debugLines +=
+                            String.format(
+                                Locale.US,
+                                "  radial consistency = %.2f",
+                                radialConsistency
+                            )
+
+                        debugLines +=
+                            String.format(
+                                Locale.US,
+                                "  ellipse fit = %.2f",
+                                fitScore
+                            )
+
+                        debugLines +=
+                            String.format(
+                                Locale.US,
+                                "  edge strength = %.2f",
+                                edgeScore
+                            )
+
+                        debugLines +=
+                            String.format(
+                                Locale.US,
+                                "  final score = %.2f",
+                                score
+                            )
+
+                        debugLines +=
+                            "  FINAL = accepted"
+
+                        debugLines +=
+                            "  radial samples:"
+
+                        boundary.radialDebugPoints
+                            ?.forEach { point ->
+
+                                debugLines +=
+                                    String.format(
+                                        Locale.US,
+                                        "    %6.1f°  r=%6.1f  g=%8.2f  (%6.1f,%6.1f)",
+                                        point.angleDegrees,
+                                        point.radius,
+                                        point.gradient,
+                                        point.point.x + sx,
+                                        point.point.y + sy
+                                    )
+                            }
+
+                        debugLines += ""
+                    }
+
+                    /*
+                     * Draw fitted ellipse as well.
+                     */
+                    if (
+                        debugMat != null
+                    ) {
+
+                        Imgproc.ellipse(
+                            debugMat,
+                            RotatedRect(
+                                Point(
+                                    ellipse.center.x + sx,
+                                    ellipse.center.y + sy
+                                ),
+                                ellipse.size,
+                                ellipse.angle
                             ),
+                            Scalar(
+                                0.0,
+                                255.0,
+                                0.0
+                            ),
+                            2
+                        )
+                    }
 
-                        score = score,
-
-                        radius = radius,
-
-                        aspectRatio = aspect,
-
-                        fitScore = fitScore,
-
-                        coverage = coverageScore
-                    )
+                    return result
 
                 } finally {
                     smoothed.release()
@@ -1062,9 +1417,6 @@ object WoodDetector {
 
     /**
      * Estimate an initial radius.
-     *
-     * At this stage this is deliberately broad. Later we can replace
-     * this with the jack-derived estimate.
      */
     private fun estimateInitialRadius(
         original: Mat,
@@ -1073,48 +1425,43 @@ object WoodDetector {
         workingScale: Double
     ): Double {
 
-        /*
-         * Start from a sensible fraction of the working-image size.
-         *
-         * The radial search itself can expand/contract from this value.
-         */
         val imageScale =
             maxOf(
                 original.cols(),
                 original.rows()
             ).toDouble()
 
-        /*
-         * Typical wood radius at a 1024px working image.
-         */
         val workingRadius =
             (
-                    imageScale *
-                            workingScale
-                    ) *
-                    0.035
+                    imageScale * workingScale
+                    ) * 0.035
 
         return workingRadius
             .coerceIn(
                 14.0,
                 90.0
-            ) /
-                workingScale
+            ) / workingScale
     }
 
     /**
      * Search radially for the strongest boundary transition.
      *
-     * This is where we deliberately return to the original image.
+     * Debug information records the selected point from each radial
+     * direction.
      */
     private fun findRadialBoundary(
         image: Mat,
         centre: Point,
-        expectedRadius: Double
+        expectedRadius: Double,
+        debugLines: MutableList<String>? = null,
+        candidateIndex: Int = -1
     ): BoundaryResult? {
 
         val points =
             mutableListOf<Point>()
+
+        val radialDebug =
+            mutableListOf<RadialDebugPoint>()
 
         var strengthSum =
             0.0
@@ -1151,9 +1498,6 @@ object WoodDetector {
             var bestStrength =
                 0.0
 
-            /*
-             * Sample every 1 pixel along the radial line.
-             */
             var radius =
                 minRadius
 
@@ -1163,23 +1507,19 @@ object WoodDetector {
 
                 val x =
                     centre.x +
-                            dx *
-                            radius
+                            dx * radius
 
                 val y =
                     centre.y +
-                            dy *
-                            radius
+                            dy * radius
 
                 val previousX =
                     centre.x +
-                            dx *
-                            (radius - 1.0)
+                            dx * (radius - 1.0)
 
                 val previousY =
                     centre.y +
-                            dy *
-                            (radius - 1.0)
+                            dy * (radius - 1.0)
 
                 if (
                     !inside(
@@ -1212,13 +1552,11 @@ object WoodDetector {
 
                 val gradient =
                     abs(
-                        current -
-                                previous
+                        current - previous
                     )
 
                 if (
-                    gradient >
-                    bestStrength
+                    gradient > bestStrength
                 ) {
 
                     bestStrength =
@@ -1237,15 +1575,29 @@ object WoodDetector {
                 MIN_EDGE_STRENGTH
             ) {
 
-                points +=
+                val point =
                     Point(
                         centre.x +
-                                dx *
-                                bestRadius,
+                                dx * bestRadius,
 
                         centre.y +
-                                dy *
-                                bestRadius
+                                dy * bestRadius
+                    )
+
+                points += point
+
+                radialDebug +=
+                    RadialDebugPoint(
+                        angleDegrees =
+                            Math.toDegrees(
+                                angle
+                            ),
+                        radius =
+                            bestRadius,
+                        gradient =
+                            bestStrength,
+                        point =
+                            point
                     )
 
                 strengthSum +=
@@ -1262,6 +1614,29 @@ object WoodDetector {
             return null
         }
 
+        val radii =
+            radialDebug
+                .map { it.radius }
+                .sorted()
+
+        val median =
+            if (
+                radii.size % 2 == 0
+            ) {
+                (
+                        radii[
+                            radii.size / 2 - 1
+                        ] +
+                                radii[
+                                    radii.size / 2
+                                ]
+                        ) / 2.0
+            } else {
+                radii[
+                    radii.size / 2
+                ]
+            }
+
         return BoundaryResult(
 
             points = points,
@@ -1272,13 +1647,27 @@ object WoodDetector {
 
             meanStrength =
                 strengthSum /
-                        successful
+                        successful,
+
+            radialDebugPoints =
+                radialDebug,
+
+            radialMin =
+                radii.minOrNull()
+                    ?: 0.0,
+
+            radialMax =
+                radii.maxOrNull()
+                    ?: 0.0,
+
+            radialMean =
+                radii.average(),
+
+            radialMedian =
+                median
         )
     }
 
-    /**
-     * Fit an ellipse to the radial boundary points.
-     */
     private fun fitBoundaryEllipse(
         points: List<Point>
     ): RotatedRect? {
@@ -1289,12 +1678,9 @@ object WoodDetector {
             return null
         }
 
-        val pointArray =
-            points.toTypedArray()
-
         val contour =
             MatOfPoint2f(
-                *pointArray
+                *points.toTypedArray()
             )
 
         try {
@@ -1312,22 +1698,16 @@ object WoodDetector {
         }
     }
 
-    /**
-     * Measures how closely the boundary points lie on the fitted
-     * ellipse.
-     */
     private fun ellipseFitScore(
         points: List<Point>,
         ellipse: RotatedRect
     ): Double {
 
         val a =
-            ellipse.size.width /
-                    2.0
+            ellipse.size.width / 2.0
 
         val b =
-            ellipse.size.height /
-                    2.0
+            ellipse.size.height / 2.0
 
         if (
             a <= 0.0 ||
@@ -1365,31 +1745,20 @@ object WoodDetector {
                 point.y -
                         ellipse.center.y
 
-            /*
-             * Rotate point into ellipse coordinates.
-             */
             val ex =
-                dx *
-                        cosA +
-                        dy *
-                        sinA
+                dx * cosA +
+                        dy * sinA
 
             val ey =
-                -dx *
-                        sinA +
-                        dy *
-                        cosA
+                -dx * sinA +
+                        dy * cosA
 
             val normalized =
                 sqrt(
-                    (
-                            ex * ex /
-                                    (a * a)
-                            ) +
-                            (
-                                    ey * ey /
-                                            (b * b)
-                                    )
+                    ex * ex /
+                            (a * a) +
+                            ey * ey /
+                            (b * b)
                 )
 
             val error =
@@ -1397,9 +1766,7 @@ object WoodDetector {
                     normalized - 1.0
                 )
 
-            errorSum +=
-                error
-
+            errorSum += error
             count++
         }
 
@@ -1410,13 +1777,11 @@ object WoodDetector {
         }
 
         val meanError =
-            errorSum /
-                    count
+            errorSum / count
 
         return (
                 1.0 -
-                        meanError /
-                        0.35
+                        meanError / 0.35
                 )
             .coerceIn(
                 0.0,
@@ -1424,24 +1789,16 @@ object WoodDetector {
             )
     }
 
-    /**
-     * Measures how consistently the boundary surrounds the candidate.
-     *
-     * We compare the radial distances of the detected points with the
-     * fitted ellipse rather than simply measuring circularity.
-     */
     private fun radialConsistencyScore(
         points: List<Point>,
         ellipse: RotatedRect
     ): Double {
 
         val a =
-            ellipse.size.width /
-                    2.0
+            ellipse.size.width / 2.0
 
         val b =
-            ellipse.size.height /
-                    2.0
+            ellipse.size.height / 2.0
 
         if (
             a <= 0.0 ||
@@ -1480,16 +1837,12 @@ object WoodDetector {
                         ellipse.center.y
 
             val ex =
-                dx *
-                        cosA +
-                        dy *
-                        sinA
+                dx * cosA +
+                        dy * sinA
 
             val ey =
-                -dx *
-                        sinA +
-                        dy *
-                        cosA
+                -dx * sinA +
+                        dy * cosA
 
             val radial =
                 sqrt(
@@ -1497,9 +1850,6 @@ object WoodDetector {
                             ey * ey
                 )
 
-            /*
-             * Expected radius of the ellipse in this direction.
-             */
             val theta =
                 atan2(
                     ey,
@@ -1507,9 +1857,7 @@ object WoodDetector {
                 )
 
             val expected =
-                (
-                        a * b
-                        ) /
+                a * b /
                         sqrt(
                             (
                                     b * cos(theta)
@@ -1525,10 +1873,8 @@ object WoodDetector {
 
                 errorSum +=
                     abs(
-                        radial -
-                                expected
-                    ) /
-                            expected
+                        radial - expected
+                    ) / expected
 
                 count++
             }
@@ -1541,13 +1887,11 @@ object WoodDetector {
         }
 
         val meanError =
-            errorSum /
-                    count
+            errorSum / count
 
         return (
                 1.0 -
-                        meanError /
-                        0.35
+                        meanError / 0.35
                 )
             .coerceIn(
                 0.0,
@@ -1555,9 +1899,6 @@ object WoodDetector {
             )
     }
 
-    /**
-     * Remove duplicate candidates and retain the four strongest.
-     */
     private fun selectCandidates(
         candidates: List<RefinedCandidate>
     ): List<BlobDetection> {
@@ -1566,8 +1907,7 @@ object WoodDetector {
             mutableListOf<RefinedCandidate>()
 
         for (
-        candidate
-        in candidates.sortedByDescending {
+        candidate in candidates.sortedByDescending {
             it.score
         }
         ) {
@@ -1577,19 +1917,15 @@ object WoodDetector {
 
                     val dx =
                         candidate.detection
-                            .centre
-                            .x -
+                            .centre.x -
                                 existing.detection
-                                    .centre
-                                    .x
+                                    .centre.x
 
                     val dy =
                         candidate.detection
-                            .centre
-                            .y -
+                            .centre.y -
                                 existing.detection
-                                    .centre
-                                    .y
+                                    .centre.y
 
                     val distance =
                         sqrt(
@@ -1608,8 +1944,7 @@ object WoodDetector {
             if (
                 !duplicate
             ) {
-                selected +=
-                    candidate
+                selected += candidate
             }
 
             if (
@@ -1629,9 +1964,6 @@ object WoodDetector {
             }
     }
 
-    /**
-     * Convert Mat to greyscale.
-     */
     private fun convertToGray(
         source: Mat,
         destination: Mat
@@ -1665,12 +1997,6 @@ object WoodDetector {
         }
     }
 
-    /**
-     * Bilinear-ish local greyscale sample using nearest pixel.
-     *
-     * For the boundary search this is sufficient because the image
-     * has already had a small 5px Gaussian blur applied.
-     */
     private fun sampleGray(
         image: Mat,
         x: Double,
@@ -1708,15 +2034,10 @@ object WoodDetector {
 
         return x >= 1.0 &&
                 y >= 1.0 &&
-                x <
-                image.cols() - 1 &&
-                y <
-                image.rows() - 1
+                x < image.cols() - 1 &&
+                y < image.rows() - 1
     }
 
-    /**
-     * Resize the complete image once.
-     */
     private fun resizeForDetection(
         source: Mat,
         scale: Double
@@ -1740,15 +2061,15 @@ object WoodDetector {
                 result,
                 Size(
                     (
-                            source.cols() *
-                                    scale
-                            ).roundToInt()
+                            source.cols() * scale
+                            )
+                        .roundToInt()
                         .toDouble(),
 
                     (
-                            source.rows() *
-                                    scale
-                            ).roundToInt()
+                            source.rows() * scale
+                            )
+                        .roundToInt()
                         .toDouble()
                 )
             )
@@ -1768,12 +2089,10 @@ object WoodDetector {
             ).toDouble()
 
         return if (
-            maximum >
-            TARGET_MAX_DIM
+            maximum > TARGET_MAX_DIM
         ) {
 
-            TARGET_MAX_DIM /
-                    maximum
+            TARGET_MAX_DIM / maximum
 
         } else {
 
@@ -1781,13 +2100,132 @@ object WoodDetector {
         }
     }
 
+    /**
+     * Draw all selected radial edge points.
+     *
+     * The points are supplied in ROI-local ORIGINAL-image coordinates,
+     * so sx/sy convert them back to the full original image.
+     */
+    private fun drawRadialDebugPoints(
+        image: Mat,
+        points: List<RadialDebugPoint>,
+        sx: Int,
+        sy: Int
+    ) {
+
+        for (
+        point in points
+        ) {
+
+            Imgproc.circle(
+                image,
+                Point(
+                    point.point.x + sx,
+                    point.point.y + sy
+                ),
+                3,
+                Scalar(
+                    255.0,
+                    0.0,
+                    0.0
+                ),
+                -1
+            )
+        }
+    }
+
+    private fun drawClickedPoint(
+        image: Mat,
+        point: Point2
+    ) {
+
+        Imgproc.circle(
+            image,
+            Point(
+                point.x.toDouble(),
+                point.y.toDouble()
+            ),
+            6,
+            Scalar(
+                0.0,
+                255.0,
+                255.0
+            ),
+            2
+        )
+    }
+
+    private fun drawSelectedCandidate(
+        image: Mat,
+        candidate: RefinedCandidate
+    ) {
+
+        val centre =
+            Point(
+                candidate.detection
+                    .centre.x.toDouble(),
+                candidate.detection
+                    .centre.y.toDouble()
+            )
+
+        Imgproc.circle(
+            image,
+            centre,
+            6,
+            Scalar(
+                0.0,
+                255.0,
+                0.0
+            ),
+            2
+        )
+    }
+
+    private fun matToBitmap(
+        mat: Mat
+    ): Bitmap {
+
+        val bitmap =
+            Bitmap.createBitmap(
+                mat.cols(),
+                mat.rows(),
+                Bitmap.Config.ARGB_8888
+            )
+
+        Utils.matToBitmap(
+            mat,
+            bitmap
+        )
+
+        return bitmap
+    }
+
+    private data class CandidateDebug(
+        var contours: Int = 0,
+        var afterAreaFilter: Int = 0,
+        var responseMin: Double = 0.0,
+        var responseMax: Double = 0.0,
+        var responseMean: Double = 0.0
+    )
+
     private data class BoundaryResult(
 
         val points: List<Point>,
 
         val coverage: Double,
 
-        val meanStrength: Double
+        val meanStrength: Double,
+
+        val radialDebugPoints:
+        List<RadialDebugPoint>? = null,
+
+        val radialMin: Double = 0.0,
+
+        val radialMax: Double = 0.0,
+
+        val radialMean: Double = 0.0,
+
+        val radialMedian: Double = 0.0
     )
 
     private data class RefinedCandidate(
