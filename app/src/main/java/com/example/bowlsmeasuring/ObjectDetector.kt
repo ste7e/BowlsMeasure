@@ -3,7 +3,6 @@ package com.example.bowlsmeasuring
 import android.graphics.Bitmap
 import org.opencv.android.Utils
 import org.opencv.core.*
-import org.opencv.geometry.Geometry
 import org.opencv.imgproc.Imgproc
 import kotlin.math.*
 
@@ -12,54 +11,31 @@ object ObjectDetector {
     private const val MAX_WORKING_SIZE = 1024
 
     /*
-     * The blur is deliberately heavy. We are looking for objects at roughly
-     * the scale of bowls/woods, not individual blades of grass.
-     */
-    private val BLUR_SIGMAS = doubleArrayOf(
-        6.0,
-        8.0,
-        11.0,
-        15.0,
-        20.0,
-        26.0
-    )
-
-    private val BLUR_KERNELS = intArrayOf(
-        25,
-        31,
-        41,
-        51,
-        71,
-        91
-    )
-
-    /*
-     * This is ONLY an image-processing relationship between blur scale and
-     * approximate object radius. It has nothing to do with the physical
-     * jack/wood diameter ratio.
-     */
-    private const val SCALE_TO_RADIUS = 1.5
-
-    private const val ROI_SIZE = 360
-
-    /*
-     * Number of angular samples used when evaluating a candidate ring.
-     */
-    private const val RING_SAMPLES = 96
-
-    /*
-     * Fraction of the candidate circumference which must have reasonably
-     * strong boundary evidence.
-     */
-    private const val MIN_RING_COVERAGE = 0.42
-
-    /*
-     * Maximum permitted eccentricity during the circular search.
+     * Hough circle parameters.
      *
-     * We deliberately allow quite a lot because perspective can make a
-     * circular wood look elliptical.
+     * These are deliberately fairly broad because:
+     *
+     * - woods may be black or brown
+     * - the visible boundary can be weak
+     * - perspective makes the apparent circle imperfect
      */
-    private const val MAX_ECCENTRICITY = 0.45
+    private const val MIN_RADIUS = 12.0
+    private const val MAX_RADIUS = 110.0
+
+    private const val MIN_DISTANCE_BETWEEN_CIRCLES = 18.0
+
+    /*
+     * Hough parameters.
+     *
+     * param1 = Canny high threshold
+     * param2 = accumulator threshold
+     *
+     * Lower param2 gives more candidates but also more false positives.
+     */
+    private const val HOUGH_PARAM1 = 100.0
+    private const val HOUGH_PARAM2 = 15.0
+
+    private const val EDGE_SAMPLES = 96
 
     data class BlobDetection(
         val centre: Point2,
@@ -68,34 +44,16 @@ object ObjectDetector {
         val solidity: Float
     )
 
-    private data class CandidateCentre(
+    private data class CircleCandidate(
         val centre: Point,
-        val estimatedRadius: Double,
-        val response: Double
+        val radius: Double
     )
 
-    private data class RingResult(
-        val centre: Point,
-        val radius: Double,
-        val score: Double,
-        val coverage: Double,
-        val meanEdge: Double,
-        val consistency: Double
+    private data class ScoredCandidate(
+        val candidate: CircleCandidate,
+        val score: Double
     )
 
-    private data class RefinedCandidate(
-        val detection: BlobDetection,
-        val score: Double,
-        val clickDistance: Double,
-        val ring: RingResult
-    )
-
-    /**
-     * Detect the physical object nearest to the user's click.
-     *
-     * The click defines the area in which we expect the object to be.
-     * It does NOT itself become an artificial detection.
-     */
     fun detectNear(
         bitmap: Bitmap,
         clickedPoint: Point2
@@ -106,393 +64,556 @@ object ObjectDetector {
         try {
             Utils.bitmapToMat(bitmap, source)
 
-            val scale = min(
-                1.0,
-                MAX_WORKING_SIZE.toDouble() /
-                        max(source.cols(), source.rows()).toDouble()
-            )
+            val scale =
+                min(
+                    1.0,
+                    MAX_WORKING_SIZE.toDouble() /
+                            max(source.cols(), source.rows()).toDouble()
+                )
 
             val working = Mat()
 
-            if (scale < 0.999) {
-                Imgproc.resize(
-                    source,
-                    working,
-                    Size(),
-                    scale,
-                    scale,
-                    Imgproc.INTER_AREA
-                )
-            } else {
-                source.copyTo(working)
-            }
-
-            val click = Point(
-                clickedPoint.x * scale,
-                clickedPoint.y * scale
-            )
-
-            val roiRect = makeRoi(
-                click,
-                working.cols(),
-                working.rows()
-            )
-
-            val roi = Mat(working, roiRect)
-
-            val localClick = Point(
-                click.x - roiRect.x,
-                click.y - roiRect.y
-            )
-
-            val candidates = findCandidateCentres(
-                roi
-            )
-
-            if (candidates.isEmpty()) {
-                return null
-            }
-
-            val refined = mutableListOf<RefinedCandidate>()
-
-            for (candidate in candidates) {
-
-                val candidateDistance = distance(
-                    candidate.centre,
-                    localClick
-                )
-
-                /*
-                 * Don't allow a candidate on the opposite side of the ROI
-                 * to win merely because it has a strong edge.
-                 */
-                if (candidateDistance > ROI_SIZE * 0.55) {
-                    continue
+            try {
+                if (scale < 0.999) {
+                    Imgproc.resize(
+                        source,
+                        working,
+                        Size(),
+                        scale,
+                        scale,
+                        Imgproc.INTER_AREA
+                    )
+                } else {
+                    source.copyTo(working)
                 }
 
-                val ring = findBestRing(
-                    roi,
-                    candidate.centre,
-                    candidate.estimatedRadius
-                ) ?: continue
+                val click = Point(
+                    clickedPoint.x * scale,
+                    clickedPoint.y * scale
+                )
 
                 /*
-                 * The user's click MUST be inside the detected circle.
+                 * Use a reasonably large ROI around the click.
                  *
-                 * This is a hard constraint, not a scoring preference.
-                 *
-                 * The click does not need to be near the centre of the
-                 * circle: the user may deliberately click off-centre on a
-                 * wood, jack or shadow.
+                 * This prevents things elsewhere in the photograph
+                 * from generating Hough circles.
                  */
-                val clickInsideDistance = distance(
-                    ring.centre,
-                    localClick
+                val roiSize = 360
+
+                val x1 =
+                    max(
+                        0,
+                        (click.x - roiSize / 2).roundToInt()
+                    )
+
+                val y1 =
+                    max(
+                        0,
+                        (click.y - roiSize / 2).roundToInt()
+                    )
+
+                val x2 =
+                    min(
+                        working.cols(),
+                        x1 + roiSize
+                    )
+
+                val y2 =
+                    min(
+                        working.rows(),
+                        y1 + roiSize
+                    )
+
+                val roiRect = Rect(
+                    x1,
+                    y1,
+                    x2 - x1,
+                    y2 - y1
                 )
 
-                if (clickInsideDistance > ring.radius) {
-                    continue
+                if (roiRect.width <= 20 || roiRect.height <= 20) {
+                    return null
                 }
 
-                if (ring.coverage < MIN_RING_COVERAGE) {
-                    continue
+                val roi = Mat(working, roiRect)
+
+                try {
+
+                    val localClick = Point(
+                        click.x - roiRect.x,
+                        click.y - roiRect.y
+                    )
+
+                    val circles =
+                        findHoughCircles(roi)
+
+                    if (circles.isEmpty()) {
+                        return null
+                    }
+
+                    val scored =
+                        mutableListOf<ScoredCandidate>()
+
+                    for (candidate in circles) {
+
+                        /*
+                         * IMPORTANT:
+                         *
+                         * The clicked point must actually be inside
+                         * the candidate circle.
+                         *
+                         * This stops a nearby shadow/grass circle
+                         * becoming the answer when the user clicked
+                         * directly on the wood.
+                         */
+                        val clickDistance =
+                            distance(
+                                candidate.centre,
+                                localClick
+                            )
+
+                        /*
+                         * The user is expected to click roughly at the centre
+                         * of the object. Reject circles whose centre is too far
+                         * from the click.
+                         *
+                         * This prevents a large circle whose circumference passes
+                         * through the click from being accepted.
+                         */
+                        if (clickDistance > candidate.radius * 0.35) {
+                            continue
+                        }
+
+                        /*
+                         * Score the actual circle against the image.
+                         */
+                        val score =
+                            scoreCircle(
+                                roi,
+                                candidate
+                            )
+
+                        if (score.isFinite()) {
+                            scored +=
+                                ScoredCandidate(
+                                    candidate,
+                                    score
+                                )
+                        }
+                    }
+
+                    if (scored.isEmpty()) {
+                        return null
+                    }
+
+                    /*
+                     * Sort strongest first.
+                     */
+                    scored.sortByDescending { it.score }
+
+                    /*
+                     * Prefer the smallest credible circle when
+                     * several circles have nearly identical scores.
+                     *
+                     * This is important for the wood+shadow problem:
+                     * a large circle can often get good edge coverage
+                     * simply because it includes lots of image structure.
+                     */
+                    /*
+                     * At this stage, proximity to the click is more important
+                     * than finding the mathematically strongest edge.
+                     *
+                     * The click is our strongest piece of information about
+                     * which object the user wants.
+                     */
+                    val chosen =
+                        scored.minWithOrNull(
+                            compareBy<ScoredCandidate> {
+                                distance(
+                                    it.candidate.centre,
+                                    localClick
+                                )
+                            }.thenByDescending {
+                                it.score
+                            }
+                        ) ?: return null
+
+                    return makeDetection(
+                        candidate = chosen.candidate,
+                        scale = scale,
+                        roiRect = roiRect
+                    )
+
+                } finally {
+                    roi.release()
                 }
 
-                val detection = makeDetection(
-                    roi = roi,
-                    ring = ring,
-                    scale = scale,
-                    roiRect = roiRect
-                ) ?: continue
-
-                /*
-                 * At this point the candidate has passed the hard click-containment
-                 * test, so proximity is only a small tie-breaker.
-                 */
-                val proximity =
-                    1.0 -
-                            (candidateDistance / 100.0)
-                                .coerceIn(0.0, 1.0)
-
-                val finalScore =
-                    ring.score +
-                            proximity * 0.10
-
-                refined += RefinedCandidate(
-                    detection = detection,
-                    score = finalScore,
-                    clickDistance = clickInsideDistance,
-                    ring = ring
-                )
+            } finally {
+                working.release()
             }
-
-            /*
-             * Do NOT simply take the closest candidate.
-             *
-             * A shadow can be very close to the click but have poor closed
-             * ring coherence.
-             */
-            return refined
-                .maxByOrNull { it.score }
-                ?.detection
 
         } finally {
             source.release()
         }
     }
 
-    // ---------------------------------------------------------------------
-    // Candidate detection
-    // ---------------------------------------------------------------------
+    fun createDebugImage(
+        bitmap: Bitmap,
+        clickedPoint: Point2
+    ): Bitmap? {
 
-    private fun findCandidateCentres(
+        val source = Mat()
+
+        try {
+            Utils.bitmapToMat(bitmap, source)
+
+            val scale =
+                min(
+                    1.0,
+                    MAX_WORKING_SIZE.toDouble() /
+                            max(source.cols(), source.rows()).toDouble()
+                )
+
+            val working = Mat()
+
+            try {
+                if (scale < 0.999) {
+                    Imgproc.resize(
+                        source,
+                        working,
+                        Size(),
+                        scale,
+                        scale,
+                        Imgproc.INTER_AREA
+                    )
+                } else {
+                    source.copyTo(working)
+                }
+
+                val click = Point(
+                    clickedPoint.x * scale,
+                    clickedPoint.y * scale
+                )
+
+                val roiSize = 360
+
+                val x1 =
+                    max(
+                        0,
+                        (click.x - roiSize / 2).roundToInt()
+                    )
+
+                val y1 =
+                    max(
+                        0,
+                        (click.y - roiSize / 2).roundToInt()
+                    )
+
+                val x2 =
+                    min(
+                        working.cols(),
+                        x1 + roiSize
+                    )
+
+                val y2 =
+                    min(
+                        working.rows(),
+                        y1 + roiSize
+                    )
+
+                val roiRect = Rect(
+                    x1,
+                    y1,
+                    x2 - x1,
+                    y2 - y1
+                )
+
+                val roi = Mat(working, roiRect)
+
+                try {
+                    val localClick = Point(
+                        click.x - roiRect.x,
+                        click.y - roiRect.y
+                    )
+
+                    /*
+                     * Draw over a colour copy of the ROI.
+                     */
+                    val debug = Mat()
+                    roi.copyTo(debug)
+
+                    val circles =
+                        findHoughCircles(roi)
+
+                    /*
+                     * Work out which circles pass our current
+                     * centre-distance constraint.
+                     */
+                    val scored =
+                        mutableListOf<ScoredCandidate>()
+
+                    for (candidate in circles) {
+
+                        val clickDistance =
+                            distance(
+                                candidate.centre,
+                                localClick
+                            )
+
+                        if (
+                            clickDistance <=
+                            candidate.radius * 0.35
+                        ) {
+
+                            val score =
+                                scoreCircle(
+                                    roi,
+                                    candidate
+                                )
+
+                            if (score.isFinite()) {
+                                scored +=
+                                    ScoredCandidate(
+                                        candidate,
+                                        score
+                                    )
+                            }
+                        }
+                    }
+
+                    /*
+                     * Find the candidate our current detector
+                     * would actually select.
+                     */
+                    val selected =
+                        scored.minWithOrNull(
+                            compareBy<ScoredCandidate> {
+                                distance(
+                                    it.candidate.centre,
+                                    localClick
+                                )
+                            }.thenByDescending {
+                                it.score
+                            }
+                        )?.candidate
+
+                    /*
+                     * Draw every Hough candidate.
+                     *
+                     * RED:
+                     *     rejected by centre-distance constraint
+                     *
+                     * GREEN:
+                     *     passed centre-distance constraint
+                     *
+                     * BLUE:
+                     *     selected candidate
+                     */
+                    for (candidate in circles) {
+
+                        val clickDistance =
+                            distance(
+                                candidate.centre,
+                                localClick
+                            )
+
+                        val passes =
+                            clickDistance <=
+                                    candidate.radius * 0.35
+
+                        val isSelected =
+                            selected != null &&
+                                    distance(
+                                        candidate.centre,
+                                        selected.centre
+                                    ) < 0.01 &&
+                                    abs(
+                                        candidate.radius -
+                                                selected.radius
+                                    ) < 0.01
+
+                        val colour =
+                            when {
+                                isSelected ->
+                                    Scalar(0.0, 0.0, 255.0, 64.0) // blue
+
+                                passes ->
+                                    Scalar(0.0, 255.0, 0.0, 64.0) // green
+
+                                else ->
+                                    Scalar(255.0, 0.0, 0.0, 64.0) // red
+                            }
+
+                        Imgproc.circle(
+                            debug,
+                            candidate.centre,
+                            candidate.radius.roundToInt(),
+                            colour,
+                            2
+                        )
+
+                        /*
+                         * Draw the candidate centre.
+                         */
+                        Imgproc.circle(
+                            debug,
+                            candidate.centre,
+                            3,
+                            colour,
+                            Imgproc.FILLED
+                        )
+                    }
+
+                    /*
+                     * Draw the click point as a yellow cross.
+                     */
+                    val crossSize = 10
+
+                    Imgproc.line(
+                        debug,
+                        Point(
+                            localClick.x - crossSize,
+                            localClick.y
+                        ),
+                        Point(
+                            localClick.x + crossSize,
+                            localClick.y
+                        ),
+                        Scalar(0.0, 255.0, 255.0, 255.0),
+                        2
+                    )
+
+                    Imgproc.line(
+                        debug,
+                        Point(
+                            localClick.x,
+                            localClick.y - crossSize
+                        ),
+                        Point(
+                            localClick.x,
+                            localClick.y + crossSize
+                        ),
+                        Scalar(0.0, 255.0, 255.0, 255.0),
+                        2
+                    )
+
+                    /*
+                     * Convert back to Bitmap.
+                     */
+                    val output =
+                        Bitmap.createBitmap(
+                            debug.cols(),
+                            debug.rows(),
+                            Bitmap.Config.ARGB_8888
+                        )
+
+                    Utils.matToBitmap(
+                        debug,
+                        output
+                    )
+
+                    debug.release()
+
+                    return output
+
+                } finally {
+                    roi.release()
+                }
+
+            } finally {
+                working.release()
+            }
+
+        } finally {
+            source.release()
+        }
+    }
+
+    private fun findHoughCircles(
         roi: Mat
-    ): List<CandidateCentre> {
+    ): List<CircleCandidate> {
 
         val gray = Mat()
 
         try {
+
             Imgproc.cvtColor(
                 roi,
                 gray,
                 Imgproc.COLOR_RGBA2GRAY
             )
 
-            val candidates = mutableListOf<CandidateCentre>()
+            /*
+             * Mild blur suppresses grass texture while retaining
+             * the relatively strong object boundary.
+             */
+            Imgproc.GaussianBlur(
+                gray,
+                gray,
+                Size(5.0, 5.0),
+                1.2
+            )
 
-            for (i in BLUR_SIGMAS.indices) {
+            val circles = Mat()
 
-                val sigma = BLUR_SIGMAS[i]
-                val kernel = BLUR_KERNELS[i]
+            try {
 
-                val blurred = Mat()
+                Imgproc.HoughCircles(
+                    gray,
+                    circles,
+                    Imgproc.HOUGH_GRADIENT,
+                    1.0,
+                    MIN_DISTANCE_BETWEEN_CIRCLES,
+                    HOUGH_PARAM1,
+                    HOUGH_PARAM2,
+                    MIN_RADIUS.roundToInt(),
+                    MAX_RADIUS.roundToInt()
+                )
 
-                try {
-                    Imgproc.GaussianBlur(
-                        gray,
-                        blurred,
-                        Size(kernel.toDouble(), kernel.toDouble()),
-                        sigma,
-                        sigma,
-                        Core.BORDER_REPLICATE
-                    )
+                val result =
+                    mutableListOf<CircleCandidate>()
 
-                    /*
-                     * Large-scale local contrast.
-                     *
-                     * We compare the heavily blurred image with an even
-                     * more heavily blurred background. This suppresses grass
-                     * texture and leaves larger structures.
-                     */
-                    val background = Mat()
+                for (i in 0 until circles.cols()) {
 
-                    try {
-                        val bgKernel = kernel * 2 + 1
-                        val bgSigma = sigma * 2.0
+                    val data =
+                        circles.get(0, i)
+                            ?: continue
 
-                        Imgproc.GaussianBlur(
-                            blurred,
-                            background,
-                            Size(
-                                bgKernel.toDouble(),
-                                bgKernel.toDouble()
-                            ),
-                            bgSigma,
-                            bgSigma,
-                            Core.BORDER_REPLICATE
-                        )
-
-                        val difference = Mat()
-
-                        try {
-                            Core.absdiff(
-                                blurred,
-                                background,
-                                difference
-                            )
-
-                            val normalised = Mat()
-
-                            try {
-                                Core.normalize(
-                                    difference,
-                                    normalised,
-                                    0.0,
-                                    255.0,
-                                    Core.NORM_MINMAX,
-                                    CvType.CV_16UC1
-                                )
-
-                                /*
-                                 * Threshold only the strongest large-scale
-                                 * responses.
-                                 */
-                                val threshold = Mat()
-
-                                try {
-                                    Imgproc.threshold(
-                                        normalised,
-                                        threshold,
-                                        0.0,
-                                        255.0,
-                                        Imgproc.THRESH_BINARY or
-                                                Imgproc.THRESH_OTSU
-                                    )
-
-                                    threshold.convertTo(
-                                        threshold,
-                                        CvType.CV_8U
-                                    )
-
-                                    /*
-                                     * Remove tiny components. The opening
-                                     * also helps suppress residual grass.
-                                     */
-                                    val morphKernel =
-                                        Imgproc.getStructuringElement(
-                                            Imgproc.MORPH_ELLIPSE,
-                                            Size(9.0, 9.0)
-                                        )
-
-                                    Imgproc.morphologyEx(
-                                        threshold,
-                                        threshold,
-                                        Imgproc.MORPH_OPEN,
-                                        morphKernel
-                                    )
-
-                                    val contours =
-                                        mutableListOf<MatOfPoint>()
-
-                                    Imgproc.findContours(
-                                        threshold,
-                                        contours,
-                                        Mat(),
-                                        Imgproc.RETR_EXTERNAL,
-                                        Imgproc.CHAIN_APPROX_SIMPLE
-                                    )
-
-                                    for (contour in contours) {
-
-                                        val area =
-                                            Geometry.contourArea(contour)
-
-                                        if (area < 150.0) {
-                                            contour.release()
-                                            continue
-                                        }
-
-                                        val moments =
-                                            Geometry.moments(contour)
-
-                                        if (abs(moments.m00) < 1e-6) {
-                                            contour.release()
-                                            continue
-                                        }
-
-                                        val cx =
-                                            moments.m10 / moments.m00
-
-                                        val cy =
-                                            moments.m01 / moments.m00
-
-                                        val radius =
-                                            sigma *
-                                                    SCALE_TO_RADIUS
-
-                                        /*
-                                         * Candidate response is simply the
-                                         * average large-scale response in
-                                         * the component.
-                                         */
-                                        val response =
-                                            Geometry.contourArea(contour) /
-                                                    (roi.cols() *
-                                                            roi.rows()).toDouble()
-
-                                        candidates += CandidateCentre(
-                                            centre = Point(cx, cy),
-                                            estimatedRadius = radius,
-                                            response = response
-                                        )
-
-                                        contour.release()
-                                    }
-
-                                } finally {
-                                    threshold.release()
-                                }
-
-                            } finally {
-                                normalised.release()
-                            }
-
-                        } finally {
-                            difference.release()
-                        }
-
-                    } finally {
-                        background.release()
+                    if (data.size < 3) {
+                        continue
                     }
 
-                } finally {
-                    blurred.release()
+                    result +=
+                        CircleCandidate(
+                            centre =
+                                Point(
+                                    data[0],
+                                    data[1]
+                                ),
+                            radius = data[2]
+                        )
                 }
-            }
 
-            /*
-             * Merge candidates that are effectively the same location.
-             */
-            return mergeCandidates(candidates)
+                return result
+
+            } finally {
+                circles.release()
+            }
 
         } finally {
             gray.release()
         }
     }
 
-    private fun mergeCandidates(
-        candidates: List<CandidateCentre>
-    ): List<CandidateCentre> {
-
-        val result = mutableListOf<CandidateCentre>()
-
-        for (candidate in candidates) {
-
-            val existingIndex =
-                result.indexOfFirst {
-                    distance(it.centre, candidate.centre) < 25.0
-                }
-
-            if (existingIndex < 0) {
-                result += candidate
-            } else {
-                val existing = result[existingIndex]
-
-                /*
-                 * Keep the candidate with the stronger response.
-                 */
-                if (candidate.response > existing.response) {
-                    result[existingIndex] = candidate
-                }
-            }
-        }
-
-        return result
-    }
-
-    // ---------------------------------------------------------------------
-    // Ring search
-    // ---------------------------------------------------------------------
-
-    private fun findBestRing(
+    private fun scoreCircle(
         image: Mat,
-        initialCentre: Point,
-        estimatedRadius: Double
-    ): RingResult? {
+        candidate: CircleCandidate
+    ): Double {
 
         val gray = Mat()
 
         try {
+
             Imgproc.cvtColor(
                 image,
                 gray,
@@ -500,165 +621,252 @@ object ObjectDetector {
             )
 
             /*
-             * Light blur for stable edge measurements.
-             *
-             * We do NOT use the very heavily blurred image here because we
-             * want the actual physical boundary.
+             * Calculate a gradient image.
              */
-            val smooth = Mat()
+            val gx = Mat()
+            val gy = Mat()
 
             try {
-                Imgproc.GaussianBlur(
+
+                Imgproc.Sobel(
                     gray,
-                    smooth,
-                    Size(5.0, 5.0),
-                    1.5,
-                    1.5,
-                    Core.BORDER_REPLICATE
+                    gx,
+                    CvType.CV_32F,
+                    1,
+                    0,
+                    3
                 )
 
-                /*
-                 * Gradient magnitude.
-                 */
-                val gx = Mat()
-                val gy = Mat()
+                Imgproc.Sobel(
+                    gray,
+                    gy,
+                    CvType.CV_32F,
+                    0,
+                    1,
+                    3
+                )
+
+                val magnitude = Mat()
 
                 try {
-                    Imgproc.Sobel(
-                        smooth,
+
+                    Core.magnitude(
                         gx,
-                        CvType.CV_32F,
-                        1,
-                        0,
-                        3
-                    )
-
-                    Imgproc.Sobel(
-                        smooth,
                         gy,
-                        CvType.CV_32F,
-                        0,
-                        1,
-                        3
+                        magnitude
                     )
 
-                    val magnitude = Mat()
+                    var edgeSum = 0.0
+                    var edgeSquaredSum = 0.0
+                    var validSamples = 0
 
-                    try {
-                        Core.magnitude(
-                            gx,
-                            gy,
-                            magnitude
-                        )
+                    val radialSamples = 3
 
-                        /*
-                         * Search a reasonably broad radius range.
-                         *
-                         * This is important: we are no longer trusting the
-                         * blur-derived radius.
-                         */
-                        val minRadius =
-                            max(
-                                10.0,
-                                estimatedRadius * 0.55
-                            )
+                    /*
+                     * Sample slightly inside, on, and outside
+                     * the proposed circle.
+                     */
+                    for (i in 0 until EDGE_SAMPLES) {
 
-                        val maxRadius =
-                            min(
-                                min(
-                                    image.cols(),
-                                    image.rows()
-                                ) * 0.40,
-                                estimatedRadius * 1.80
-                            )
+                        val angle =
+                            2.0 * Math.PI *
+                                    i / EDGE_SAMPLES
 
-                        if (maxRadius <= minRadius) {
-                            return null
-                        }
+                        val cosA = cos(angle)
+                        val sinA = sin(angle)
 
-                        /*
-                         * Also search small centre offsets. The candidate
-                         * centre is only approximate.
-                         */
-                        var best: RingResult? = null
+                        var bestGradient = 0.0
 
-                        val centreStep =
-                            max(
-                                3.0,
-                                estimatedRadius * 0.12
-                            )
+                        for (rIndex in 0 until radialSamples) {
 
-                        val centreOffsets = listOf(
-                            Point(0.0, 0.0),
-                            Point(-centreStep, 0.0),
-                            Point(centreStep, 0.0),
-                            Point(0.0, -centreStep),
-                            Point(0.0, centreStep),
-                            Point(-centreStep, -centreStep),
-                            Point(centreStep, -centreStep),
-                            Point(-centreStep, centreStep),
-                            Point(centreStep, centreStep)
-                        )
+                            val radialOffset =
+                                (rIndex - 1) * 2.0
 
-                        var radius =
-                            minRadius
+                            val x =
+                                candidate.centre.x +
+                                        (candidate.radius + radialOffset) *
+                                        cosA
 
-                        while (radius <= maxRadius) {
+                            val y =
+                                candidate.centre.y +
+                                        (candidate.radius + radialOffset) *
+                                        sinA
 
-                            for (offset in centreOffsets) {
+                            val ix =
+                                x.roundToInt()
 
-                                val centre = Point(
-                                    initialCentre.x + offset.x,
-                                    initialCentre.y + offset.y
-                                )
+                            val iy =
+                                y.roundToInt()
 
-                                val result =
-                                    scoreRing(
-                                        magnitude,
-                                        centre,
-                                        radius
-                                    )
-
-                                if (result != null) {
-
-                                    val candidate =
-                                        result.copy(
-                                            centre = centre,
-                                            radius = radius
-                                        )
-
-                                    if (best == null ||
-                                        candidate.score >
-                                        best!!.score
-                                    ) {
-                                        best = candidate
-                                    }
-                                }
+                            if (
+                                ix < 0 ||
+                                iy < 0 ||
+                                ix >= magnitude.cols() ||
+                                iy >= magnitude.rows()
+                            ) {
+                                continue
                             }
 
-                            /*
-                             * Fine enough for the first pass without making
-                             * the detector unnecessarily expensive.
-                             */
-                            radius += max(
-                                2.0,
-                                estimatedRadius * 0.04
-                            )
+                            val value =
+                                magnitude.get(iy, ix)
+                                    ?.firstOrNull()
+                                    ?: continue
+
+                            if (value > bestGradient) {
+                                bestGradient = value
+                            }
                         }
 
-                        return best
+                        edgeSum += bestGradient
+                        edgeSquaredSum +=
+                            bestGradient * bestGradient
 
-                    } finally {
-                        magnitude.release()
+                        validSamples++
                     }
 
+                    if (validSamples == 0) {
+                        return Double.NEGATIVE_INFINITY
+                    }
+
+                    val meanEdge =
+                        edgeSum / validSamples
+
+                    val variance =
+                        (
+                                edgeSquaredSum /
+                                        validSamples
+                                ) -
+                                meanEdge * meanEdge
+
+                    val standardDeviation =
+                        sqrt(
+                            max(
+                                0.0,
+                                variance
+                            )
+                        )
+
+                    /*
+                     * A good object boundary should have:
+                     *
+                     * - reasonably strong gradients
+                     * - reasonably consistent gradients
+                     *
+                     * Consistency prevents one strong grass/shadow
+                     * edge from dominating the result.
+                     */
+                    val consistency =
+                        if (meanEdge > 1e-6) {
+                            meanEdge /
+                                    (meanEdge + standardDeviation)
+                        } else {
+                            0.0
+                        }
+
+                    /*
+                     * Compare brightness just inside and outside
+                     * the circle.
+                     *
+                     * This is useful for both brown and black woods.
+                     * We don't assume the object is dark — we only
+                     * look for a boundary between the two regions.
+                     */
+                    var insideSum = 0.0
+                    var outsideSum = 0.0
+                    var contrastSamples = 0
+
+                    for (i in 0 until EDGE_SAMPLES) {
+
+                        val angle =
+                            2.0 * Math.PI *
+                                    i / EDGE_SAMPLES
+
+                        val cosA = cos(angle)
+                        val sinA = sin(angle)
+
+                        val insideX =
+                            candidate.centre.x +
+                                    candidate.radius * 0.75 *
+                                    cosA
+
+                        val insideY =
+                            candidate.centre.y +
+                                    candidate.radius * 0.75 *
+                                    sinA
+
+                        val outsideX =
+                            candidate.centre.x +
+                                    candidate.radius * 1.20 *
+                                    cosA
+
+                        val outsideY =
+                            candidate.centre.y +
+                                    candidate.radius * 1.20 *
+                                    sinA
+
+                        val inside =
+                            sampleGray(
+                                gray,
+                                insideX,
+                                insideY
+                            )
+
+                        val outside =
+                            sampleGray(
+                                gray,
+                                outsideX,
+                                outsideY
+                            )
+
+                        if (
+                            inside != null &&
+                            outside != null
+                        ) {
+                            insideSum += inside
+                            outsideSum += outside
+                            contrastSamples++
+                        }
+                    }
+
+                    val contrast =
+                        if (contrastSamples > 0) {
+                            abs(
+                                insideSum /
+                                        contrastSamples -
+                                        outsideSum /
+                                        contrastSamples
+                            )
+                        } else {
+                            0.0
+                        }
+
+                    /*
+                     * Normalise the two useful signals.
+                     *
+                     * Sobel values can be considerably larger than
+                     * 255, so don't use a fixed threshold here.
+                     */
+                    val edgeScore =
+                        meanEdge /
+                                (meanEdge + 20.0)
+
+                    val contrastScore =
+                        contrast /
+                                (contrast + 20.0)
+
+                    return (
+                            edgeScore * 0.55 +
+                                    consistency * 0.20 +
+                                    contrastScore * 0.25
+                            )
+
                 } finally {
-                    gx.release()
-                    gy.release()
+                    magnitude.release()
                 }
 
             } finally {
-                smooth.release()
+                gx.release()
+                gy.release()
             }
 
         } finally {
@@ -666,439 +874,61 @@ object ObjectDetector {
         }
     }
 
-    /**
-     * Score a complete ring.
-     *
-     * The key idea:
-     *
-     * A real wood should produce boundary evidence at a large fraction of
-     * the circumference.
-     *
-     * A shadow edge should generally produce evidence over only part of it.
-     */
-    private fun scoreRing(
-        gradient: Mat,
-        centre: Point,
-        radius: Double
-    ): RingResult? {
+    private fun sampleGray(
+        image: Mat,
+        x: Double,
+        y: Double
+    ): Double? {
 
-        /*
-         * Reject rings which don't fit inside the image.
-         */
-        if (centre.x - radius - 4 < 0 ||
-            centre.y - radius - 4 < 0 ||
-            centre.x + radius + 4 >= gradient.cols() ||
-            centre.y + radius + 4 >= gradient.rows()
+        val ix = x.roundToInt()
+        val iy = y.roundToInt()
+
+        if (
+            ix < 0 ||
+            iy < 0 ||
+            ix >= image.cols() ||
+            iy >= image.rows()
         ) {
             return null
         }
 
-        val values = DoubleArray(RING_SAMPLES)
-
-        var valid = 0
-
-        for (i in 0 until RING_SAMPLES) {
-
-            val theta =
-                2.0 * Math.PI *
-                        i.toDouble() /
-                        RING_SAMPLES.toDouble()
-
-            val x =
-                centre.x +
-                        cos(theta) * radius
-
-            val y =
-                centre.y +
-                        sin(theta) * radius
-
-            val value =
-                sampleGradient(
-                    gradient,
-                    x,
-                    y
-                )
-
-            if (value.isFinite()) {
-                values[i] = value
-                valid++
-            }
-        }
-
-        if (valid < RING_SAMPLES * 0.90) {
-            return null
-        }
-
-        /*
-         * Robust local threshold.
-         *
-         * We don't use one global gradient threshold because lighting,
-         * grass colour and image exposure vary substantially.
-         */
-        val sorted =
-            values.sorted()
-
-        val median =
-            sorted[sorted.size / 2]
-
-        val upperQuartile =
-            sorted[
-                (sorted.size * 0.75)
-                    .toInt()
-                    .coerceAtMost(sorted.lastIndex)
-            ]
-
-        val noiseFloor =
-            max(
-                1.0,
-                median * 1.25
-            )
-
-        val threshold =
-            max(
-                noiseFloor,
-                upperQuartile * 0.55
-            )
-
-        var strongCount = 0
-        var totalStrength = 0.0
-
-        for (value in values) {
-
-            if (value >= threshold) {
-                strongCount++
-            }
-
-            totalStrength += value
-        }
-
-        val coverage =
-            strongCount.toDouble() /
-                    values.size.toDouble()
-
-        /*
-         * Mean strength of the complete ring.
-         */
-        val meanEdge =
-            totalStrength /
-                    values.size.toDouble()
-
-        /*
-         * Measure angular consistency.
-         *
-         * A genuine boundary should not have all its energy concentrated in
-         * one small section.
-         */
-        val mean =
-            meanEdge
-
-        var variance = 0.0
-
-        for (value in values) {
-            val d = value - mean
-            variance += d * d
-        }
-
-        variance /=
-            values.size.toDouble()
-
-        val standardDeviation =
-            sqrt(variance)
-
-        val consistency =
-            if (mean <= 1e-6) {
-                0.0
-            } else {
-                (
-                        1.0 -
-                                standardDeviation /
-                                (mean * 2.0)
-                        )
-                    .coerceIn(0.0, 1.0)
-            }
-
-        /*
-         * Coverage is the most important term.
-         *
-         * Mean edge strength alone would favour shadows because shadow
-         * boundaries can actually be stronger than wood boundaries.
-         */
-        val coverageScore =
-            coverage.pow(1.7)
-
-        val strengthScore =
-            (meanEdge / 20.0)
-                .coerceIn(0.0, 1.0)
-
-        val score =
-            coverageScore * 0.60 +
-                    strengthScore * 0.20 +
-                    consistency * 0.20
-
-        return RingResult(
-            centre = centre,
-            radius = radius,
-            score = score,
-            coverage = coverage,
-            meanEdge = meanEdge,
-            consistency = consistency
-        )
+        return image.get(iy, ix)
+            ?.firstOrNull()
     }
-
-    // ---------------------------------------------------------------------
-    // Detection / ellipse refinement
-    // ---------------------------------------------------------------------
 
     private fun makeDetection(
-        roi: Mat,
-        ring: RingResult,
-        scale: Double,
-        roiRect: Rect
-    ): BlobDetection? {
-
-        val gray = Mat()
-
-        try {
-            Imgproc.cvtColor(
-                roi,
-                gray,
-                Imgproc.COLOR_RGBA2GRAY
-            )
-
-            val edges = Mat()
-
-            try {
-
-                Imgproc.Canny(
-                    gray,
-                    edges,
-                    40.0,
-                    120.0
-                )
-
-                /*
-                 * Collect edge points close to the selected ring.
-                 */
-                val points = mutableListOf<Point>()
-
-                val searchBand =
-                    max(
-                        5.0,
-                        ring.radius * 0.12
-                    )
-
-                val minX =
-                    max(
-                        0,
-                        floor(
-                            ring.centre.x -
-                                    ring.radius -
-                                    searchBand
-                        ).toInt()
-                    )
-
-                val maxX =
-                    min(
-                        roi.cols() - 1,
-                        ceil(
-                            ring.centre.x +
-                                    ring.radius +
-                                    searchBand
-                        ).toInt()
-                    )
-
-                val minY =
-                    max(
-                        0,
-                        floor(
-                            ring.centre.y -
-                                    ring.radius -
-                                    searchBand
-                        ).toInt()
-                    )
-
-                val maxY =
-                    min(
-                        roi.rows() - 1,
-                        ceil(
-                            ring.centre.y +
-                                    ring.radius +
-                                    searchBand
-                        ).toInt()
-                    )
-
-                for (y in minY..maxY) {
-
-                    for (x in minX..maxX) {
-
-                        if (edges.get(y, x)[0] < 1.0) {
-                            continue
-                        }
-
-                        val dx =
-                            x -
-                                    ring.centre.x
-
-                        val dy =
-                            y -
-                                    ring.centre.y
-
-                        val distance =
-                            sqrt(
-                                dx * dx +
-                                        dy * dy
-                            )
-
-                        if (
-                            abs(distance - ring.radius)
-                            <= searchBand
-                        ) {
-                            points += Point(
-                                x.toDouble(),
-                                y.toDouble()
-                            )
-                        }
-                    }
-                }
-
-                /*
-                 * We need enough points for a meaningful ellipse.
-                 */
-                if (points.size < 20) {
-                    return simpleCircularDetection(
-                        ring,
-                        scale,
-                        roiRect
-                    )
-                }
-
-                val contour =
-                    MatOfPoint2f()
-
-                try {
-                    contour.fromList(points)
-
-                    val ellipse =
-                        try {
-                            Geometry.fitEllipse(contour)
-                        } catch (_: Exception) {
-                            null
-                        }
-
-                    if (ellipse == null) {
-                        return simpleCircularDetection(
-                            ring,
-                            scale,
-                            roiRect
-                        )
-                    }
-
-                    /*
-                     * fitEllipse gives full axis lengths.
-                     */
-                    val major =
-                        max(
-                            ellipse.size.width,
-                            ellipse.size.height
-                        )
-
-                    val minor =
-                        min(
-                            ellipse.size.width,
-                            ellipse.size.height
-                        )
-
-                    if (minor <= 1.0) {
-                        return simpleCircularDetection(
-                            ring,
-                            scale,
-                            roiRect
-                        )
-                    }
-
-                    val eccentricity =
-                        1.0 -
-                                minor / major
-
-                    /*
-                     * If the ellipse is wildly elongated it is much more
-                     * likely to be a shadow or unrelated edge.
-                     */
-                    if (eccentricity > MAX_ECCENTRICITY) {
-                        return simpleCircularDetection(
-                            ring,
-                            scale,
-                            roiRect
-                        )
-                    }
-
-                    val centreX =
-                        (
-                                ellipse.center.x +
-                                        roiRect.x
-                                ) / scale
-
-                    val centreY =
-                        (
-                                ellipse.center.y +
-                                        roiRect.y
-                                ) / scale
-
-                    val radiusPx =
-                        (
-                                (major + minor) / 4.0
-                                ) / scale
-
-                    val area =
-                        (
-                                Math.PI *
-                                        (major / 2.0) *
-                                        (minor / 2.0)
-                                ).toInt()
-
-                    return BlobDetection(
-                        centre = Point2(
-                            centreX.toFloat(),
-                            centreY.toFloat()
-                        ),
-                        radiusPx = radiusPx.toFloat(),
-                        areaPixels = area,
-                        solidity = ring.coverage.toFloat()
-                    )
-
-                } finally {
-                    contour.release()
-                }
-
-            } finally {
-                edges.release()
-            }
-
-        } finally {
-            gray.release()
-        }
-    }
-
-    private fun simpleCircularDetection(
-        ring: RingResult,
+        candidate: CircleCandidate,
         scale: Double,
         roiRect: Rect
     ): BlobDetection {
 
+        /*
+         * Convert from working-image/ROI coordinates back into
+         * original bitmap coordinates.
+         */
         val centreX =
             (
-                    ring.centre.x +
+                    candidate.centre.x +
                             roiRect.x
                     ) / scale
 
         val centreY =
             (
-                    ring.centre.y +
+                    candidate.centre.y +
                             roiRect.y
                     ) / scale
 
         val radius =
-            ring.radius / scale
+            candidate.radius /
+                    scale
+
+        val area =
+            (
+                    Math.PI *
+                            radius *
+                            radius
+                    )
+                .roundToInt()
 
         return BlobDetection(
             centre = Point2(
@@ -1106,125 +936,9 @@ object ObjectDetector {
                 centreY.toFloat()
             ),
             radiusPx = radius.toFloat(),
-            areaPixels = (
-                    Math.PI *
-                            radius *
-                            radius
-                    ).toInt(),
-            solidity = ring.coverage.toFloat()
+            areaPixels = area,
+            solidity = 1.0f
         )
-    }
-
-    // ---------------------------------------------------------------------
-    // Image / geometry helpers
-    // ---------------------------------------------------------------------
-
-    private fun makeRoi(
-        click: Point,
-        width: Int,
-        height: Int
-    ): Rect {
-
-        val half =
-            ROI_SIZE / 2
-
-        val left =
-            (click.x - half)
-                .toInt()
-                .coerceIn(
-                    0,
-                    max(0, width - ROI_SIZE)
-                )
-
-        val top =
-            (click.y - half)
-                .toInt()
-                .coerceIn(
-                    0,
-                    max(0, height - ROI_SIZE)
-                )
-
-        val roiWidth =
-            min(
-                ROI_SIZE,
-                width - left
-            )
-
-        val roiHeight =
-            min(
-                ROI_SIZE,
-                height - top
-            )
-
-        return Rect(
-            left,
-            top,
-            roiWidth,
-            roiHeight
-        )
-    }
-
-    private fun sampleGradient(
-        image: Mat,
-        x: Double,
-        y: Double
-    ): Double {
-
-        val x0 =
-            floor(x).toInt()
-
-        val y0 =
-            floor(y).toInt()
-
-        val x1 =
-            min(
-                image.cols() - 1,
-                x0 + 1
-            )
-
-        val y1 =
-            min(
-                image.rows() - 1,
-                y0 + 1
-            )
-
-        if (
-            x0 < 0 ||
-            y0 < 0 ||
-            x0 >= image.cols() ||
-            y0 >= image.rows()
-        ) {
-            return Double.NaN
-        }
-
-        val fx =
-            x - x0
-
-        val fy =
-            y - y0
-
-        val v00 =
-            image.get(y0, x0)[0]
-
-        val v10 =
-            image.get(y0, x1)[0]
-
-        val v01 =
-            image.get(y1, x0)[0]
-
-        val v11 =
-            image.get(y1, x1)[0]
-
-        val top =
-            v00 +
-                    (v10 - v00) * fx
-
-        val bottom =
-            v01 +
-                    (v11 - v01) * fx
-
-        return top +
-                (bottom - top) * fy
     }
 
     private fun distance(
@@ -1232,11 +946,8 @@ object ObjectDetector {
         b: Point
     ): Double {
 
-        val dx =
-            a.x - b.x
-
-        val dy =
-            a.y - b.y
+        val dx = a.x - b.x
+        val dy = a.y - b.y
 
         return sqrt(
             dx * dx +

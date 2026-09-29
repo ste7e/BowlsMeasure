@@ -323,6 +323,13 @@ private fun BowlsMeasuringScreen(viewModel: BowlsViewModel) {
                 scope.launch {
                     val b = viewModel.bitmap ?: return@launch
 
+                    val debugBitmap = ObjectDetector.createDebugImage(
+                        b,
+                        point
+                    )
+
+                    viewModel.debugImage = debugBitmap
+
                     // 1. Invoke the new shadow-immune localized peak detector
                     val detection =
                         //SimpleBlobDetector.detectNear(b, point)
@@ -538,7 +545,12 @@ private fun BowlsMeasuringScreen(viewModel: BowlsViewModel) {
             }
         }
         Card(Modifier.fillMaxWidth()) {
-            viewModel.debugImage?.asImageBitmap()?.let { Image(bitmap = it, contentDescription = null) }
+            viewModel.debugImage?.let {
+                Image(modifier = Modifier
+                    .fillMaxWidth()
+                    .fillMaxHeight(),
+                    bitmap = it.asImageBitmap(), contentDescription = null)
+            }
 //            for (line in viewModel.debugLines) {
 //                Text(line)
 //            }
