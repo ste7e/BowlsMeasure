@@ -35,6 +35,8 @@ import java.io.File
 import androidx.lifecycle.ViewModel
 import android.content.Context
 import android.graphics.BitmapFactory
+import android.os.Environment
+import android.util.Log
 import androidx.compose.foundation.Image
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
@@ -258,6 +260,36 @@ private fun BowlsMeasuringScreen(viewModel: BowlsViewModel) {
             }) { Text("Clear") }
         }
 
+        // Self test button
+        OutlinedButton(onClick = {
+//            val path = File(Environment.getExternalStorageDirectory(), "/Download/20260922_105033.jpg")
+//            viewModel.loadUri(context, path.toUri())
+            viewModel.bitmap?.let { b ->
+
+                scope.launch {
+                    Log.d("SelfTest", "click the jack")
+                    ObjectDetector.detectNear(b, Point2(932.8277f, 1426.3856f))
+                }
+
+                scope.launch {
+                    Log.d("SelfTest", "click the back wood")
+                    ObjectDetector.detectNear(b, Point2(1121.557f, 733.0918f))
+                }
+
+                scope.launch {
+                    Log.d("SelfTest", "click the front wood")
+                    ObjectDetector.detectNear(b, Point2(954.6019f, 3284.6973f))
+                }
+
+                scope.launch {
+                    Log.d("SelfTest", "click the grass")
+                    ObjectDetector.detectNear(b, Point2(1290.3679f, 1388.2075f))
+                }
+            }
+        })
+        { Text("Self test")}
+
+
 // Inside MainActivity.kt -> Look for the "Detect Woods" Button click handler:
         /*****************
         OutlinedButton(
@@ -319,16 +351,20 @@ private fun BowlsMeasuringScreen(viewModel: BowlsViewModel) {
                 if (viewModel.mode == MeasureMode.NONE) return@MeasurementCanvas
 
 // Inside MainActivity.kt -> Locate the tap listener processing block inside MeasurementCanvas:
-                viewModel.status = "Fitting ellipse using SBD Peak Fields..."
+                viewModel.status = "Fitting ellipse using ObjectDetector..."
                 scope.launch {
                     val b = viewModel.bitmap ?: return@launch
 
+/*
                     val debugBitmap = ObjectDetector.createDebugImage(
                         b,
                         point
                     )
 
                     viewModel.debugImage = debugBitmap
+*/
+
+                    Log.d("Bowls", "Click at ${point.x}, ${point.y}")
 
                     // 1. Invoke the new shadow-immune localized peak detector
                     val detection =
@@ -345,9 +381,11 @@ private fun BowlsMeasuringScreen(viewModel: BowlsViewModel) {
                         if (viewModel.mode == MeasureMode.JACK) {
                             viewModel.measurements.removeAll { it.name == "Jack" }
                             viewModel.measurements.add(ObjectMeasurement("Jack", corrected, detection.radiusPx))
+/*
                             viewModel.mode = MeasureMode.WOOD
                             val nextL = viewModel.getNextAvailableWoodLetter()
                             viewModel.status = "Jack set. Wood $nextL: tap its centre."
+*/
                         } else {
                             val overlapIndex = viewModel.measurements.indexOfFirst {
                                 it.name.startsWith("Wood") && hypot((it.centre.x - corrected.x).toDouble(), (it.centre.y - corrected.y).toDouble()) < detection.radiusPx * 1.1f
@@ -365,6 +403,7 @@ private fun BowlsMeasuringScreen(viewModel: BowlsViewModel) {
                             }
                         }
                     } else {
+                        viewModel.measurements.removeAll { it.name == "Jack" }
                         viewModel.status = "Fit failed. Make sure to tap directly inside the body of the bowl."
                     }
                     viewModel.pendingCentre = null
