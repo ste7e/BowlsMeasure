@@ -65,6 +65,7 @@ object ObjectDetector {
     private const val CONTRAST_SAMPLE_OUTER = 1.20
 
     private const val TAG = "ObjectDetector"
+    private const val DIAGNOSTIC = true
 
     /*
      * Ignore isolated strong edges. A genuine object
@@ -138,12 +139,12 @@ if (
         val points: List<BoundaryPoint>,
         val coverage: Double,
         val consistency: Double,
-        val coherence: Double,
+//        val coherence: Double,
         val interiorSupport: Double,
         val separation: Double,
         val fitQuality: Double,
         val score: Double,
-        val oppositeCoherence: Double,
+//        val oppositeCoherence: Double,
     )
     fun detectNear(
         bitmap: Bitmap,
@@ -477,20 +478,47 @@ if (
         centre: Point
     ): BoundaryResult? {
 
+        fun reject(
+            reason: String,
+            details: String = ""
+        ): BoundaryResult? {
+
+            if (DIAGNOSTIC) {
+                Log.d(
+                    TAG,
+                    String.format(
+                        java.util.Locale.US,
+                        "REJECT centre=(%.1f,%.1f) reason=%s %s",
+                        centre.x,
+                        centre.y,
+                        reason,
+                        details
+                    )
+                )
+            }
+
+            return null
+        }
+
+
         /*
          * ------------------------------------------------------------
-         * 1. Establish the appearance of the object around the centre
+         * 1. Establish seed appearance
          * ------------------------------------------------------------
          */
 
         val seedRadius = 8.0
-        val seedValues = mutableListOf<Double>()
+
+        val seedValues =
+            mutableListOf<Double>()
 
         for (dy in -seedRadius.toInt()..seedRadius.toInt()) {
+
             for (dx in -seedRadius.toInt()..seedRadius.toInt()) {
 
                 if (
-                    dx * dx + dy * dy <=
+                    dx * dx +
+                    dy * dy <=
                     seedRadius * seedRadius
                 ) {
 
@@ -509,13 +537,19 @@ if (
         }
 
         if (seedValues.size < 10) {
-            return null
+
+            return reject(
+                "SEED",
+                "samples=${seedValues.size}"
+            )
         }
 
         seedValues.sort()
 
         val seedMedian =
-            seedValues[seedValues.size / 2]
+            seedValues[
+                seedValues.size / 2
+            ]
 
         val seedMean =
             seedValues.average()
@@ -524,16 +558,14 @@ if (
             sqrt(
                 seedValues
                     .map {
-                        val d = it - seedMean
+                        val d =
+                            it - seedMean
+
                         d * d
                     }
                     .average()
             )
 
-        /*
-         * Deliberately brightness-independent enough to support both
-         * brown and black woods.
-         */
         val appearanceTolerance =
             max(
                 12.0,
@@ -543,7 +575,7 @@ if (
 
         /*
          * ------------------------------------------------------------
-         * 2. Measure radial appearance and gradient
+         * 2. Measure radial appearance support
          * ------------------------------------------------------------
          */
 
@@ -554,20 +586,29 @@ if (
                     ).toInt() + 1
 
         val ringSupport =
-            Array(radiusCount) {
-                DoubleArray(ANGLE_SAMPLES)
+            Array(
+                radiusCount
+            ) {
+                DoubleArray(
+                    ANGLE_SAMPLES
+                )
             }
 
         val ringGradient =
-            Array(radiusCount) {
-                DoubleArray(ANGLE_SAMPLES)
+            Array(
+                radiusCount
+            ) {
+                DoubleArray(
+                    ANGLE_SAMPLES
+                )
             }
 
         for (radiusIndex in 0 until radiusCount) {
 
             val radius =
                 MIN_RADIUS +
-                        radiusIndex * RADIUS_STEP
+                        radiusIndex *
+                        RADIUS_STEP
 
             for (angleIndex in 0 until ANGLE_SAMPLES) {
 
@@ -578,11 +619,13 @@ if (
 
                 val x =
                     centre.x +
-                            radius * cos(angle)
+                            radius *
+                            cos(angle)
 
                 val y =
                     centre.y +
-                            radius * sin(angle)
+                            radius *
+                            sin(angle)
 
                 val grayValue =
                     sampleGray(
@@ -621,13 +664,15 @@ if (
                         radiusIndex
                     ][
                         angleIndex
-                    ] = appearance
+                    ] =
+                        appearance
 
                     ringGradient[
                         radiusIndex
                     ][
                         angleIndex
-                    ] = gradientValue
+                    ] =
+                        gradientValue
                 }
             }
         }
@@ -642,11 +687,12 @@ if (
         val radiusResults =
             mutableListOf<RadiusResult>()
 
-        for (radiusIndex in 1 until radiusCount - 1) {
+        for (radiusIndex in 0 until radiusCount) {
 
             val radius =
                 MIN_RADIUS +
-                        radiusIndex * RADIUS_STEP
+                        radiusIndex *
+                        RADIUS_STEP
 
             val support =
                 ringSupport[
@@ -662,16 +708,22 @@ if (
                 )
 
             val previousSupport =
-                ringSupport[
-                    radiusIndex - 1
-                ].average()
+                if (radiusIndex > 0) {
+
+                    ringSupport[
+                        radiusIndex - 1
+                    ].average()
+
+                } else {
+                    support
+                }
 
             val appearanceDrop =
                 max(
                     0.0,
-                    previousSupport - support
+                    previousSupport -
+                            support
                 )
-
 
             val score =
                 appearanceDrop * 0.60 +
@@ -713,18 +765,37 @@ if (
                 current.score >= previous.score &&
                 current.score >= next.score
             ) {
+
                 peaks.add(current)
             }
         }
 
         if (peaks.isEmpty()) {
-            return null
+
+            return reject(
+                "NO_PEAK"
+            )
         }
 
+        if (DIAGNOSTIC) {
+            val peakText = peaks
+                .sortedBy { it.radius }
+                .joinToString(" | ") {
+                    "r=${"%.1f".format(it.radius)} " +
+                            "score=${"%.3f".format(it.score)} " +
+                            "support=${"%.3f".format(it.support)} " +
+                            "grad=${"%.3f".format(it.gradientScore)}"
+                }
+
+            Log.d(
+                TAG,
+                "PEAKS centre=(${"%.1f".format(centre.x)},${"%.1f".format(centre.y)}): $peakText"
+            )
+        }
 
         /*
          * ------------------------------------------------------------
-         * 5. Select the first convincing boundary
+         * 5. Select first strong boundary
          * ------------------------------------------------------------
          */
 
@@ -739,12 +810,42 @@ if (
         val selected =
             peaks
                 .filter {
-                    it.score >= minimumPeakScore
+                    it.score >=
+                            minimumPeakScore
                 }
                 .minByOrNull {
                     it.radius
                 }
-                ?: return null
+                ?: return reject(
+                    "NO_SELECTED_PEAK"
+                )
+
+
+        /*
+         * Diagnostic: report the selected radius.
+         */
+        if (DIAGNOSTIC) {
+
+            Log.d(
+                TAG,
+                String.format(
+                    java.util.Locale.US,
+                    "SELECT centre=(%.1f,%.1f) " +
+                            "radius=%.1f " +
+                            "score=%.3f " +
+                            "support=%.3f " +
+                            "gradient=%.3f " +
+                            "strongest=%.3f",
+                    centre.x,
+                    centre.y,
+                    selected.radius,
+                    selected.score,
+                    selected.support,
+                    selected.gradientScore,
+                    strongestScore
+                )
+            )
+        }
 
 
         /*
@@ -768,7 +869,8 @@ if (
         for (fraction in interiorFractions) {
 
             val radius =
-                selected.radius * fraction
+                selected.radius *
+                        fraction
 
             val radiusIndex =
                 (
@@ -830,19 +932,8 @@ if (
 
         /*
          * ------------------------------------------------------------
-         * 9. Recover ONLY genuine boundary points
+         * 9. Recover boundary points
          * ------------------------------------------------------------
-         *
-         * This is the important change.
-         *
-         * Previously we added one BoundaryPoint for every angle,
-         * even when there was little or no evidence of a boundary.
-         *
-         * Now an angle contributes a point only if:
-         *
-         *   - there is a meaningful appearance transition
-         *   - there is a real gradient
-         *   - the combined evidence is sufficiently strong
          */
 
         val boundaryPoints =
@@ -867,15 +958,6 @@ if (
             var bestStrength =
                 0.0
 
-            var bestAppearanceDrop =
-                0.0
-
-            var bestGradient =
-                0.0
-
-            /*
-             * Search ±4 pixels around the selected radius.
-             */
             for (offset in -4..4) {
 
                 val radiusIndex =
@@ -895,13 +977,6 @@ if (
                         angleIndex
                     ]
 
-                val boundarySupport =
-                    ringSupport[
-                        radiusIndex
-                    ][
-                        angleIndex
-                    ]
-
                 val outsideSupportAtPoint =
                     ringSupport[
                         radiusIndex + 1
@@ -909,10 +984,6 @@ if (
                         angleIndex
                     ]
 
-                /*
-                 * We want the boundary itself to be where the
-                 * object-like appearance starts to disappear.
-                 */
                 val appearanceDrop =
                     max(
                         0.0,
@@ -927,42 +998,16 @@ if (
                         angleIndex
                     ]
 
-                /*
-                 * Hard evidence requirements.
-                 *
-                 * A tiny gradient fluctuation in grass should not
-                 * become a boundary point.
-                 */
-                if (
-                    gradientStrength < MIN_EDGE_STRENGTH ||
-                    appearanceDrop < MIN_APPEARANCE_DROP
-                ) {
-                    continue
-                }
-
-                val gradientScore =
-                    min(
-                        1.0,
-                        gradientStrength / 80.0
-                    )
-
-                val appearanceScore =
-                    min(
-                        1.0,
-                        appearanceDrop / 0.60
-                    )
-
-                /*
-                 * Include the actual boundary appearance as a
-                 * weak sanity check too.
-                 */
                 val strength =
-                    appearanceScore * 0.55 +
-                            gradientScore * 0.35 +
-                            boundarySupport * 0.10
+                    appearanceDrop * 0.75 +
+                            min(
+                                1.0,
+                                gradientStrength / 80.0
+                            ) * 0.25
 
                 if (
-                    strength > bestStrength
+                    strength >
+                    bestStrength
                 ) {
 
                     bestStrength =
@@ -972,129 +1017,43 @@ if (
                         MIN_RADIUS +
                                 radiusIndex *
                                 RADIUS_STEP
-
-                    bestAppearanceDrop =
-                        appearanceDrop
-
-                    bestGradient =
-                        gradientStrength
                 }
             }
 
-            /*
-             * Do NOT manufacture a boundary point when the evidence
-             * isn't good enough.
-             */
-            if (
-                bestStrength >=
-                MIN_BOUNDARY_POINT_STRENGTH &&
-                bestAppearanceDrop >=
-                MIN_APPEARANCE_DROP &&
-                bestGradient >=
-                MIN_EDGE_STRENGTH
-            ) {
+            boundaryPoints.add(
+                BoundaryPoint(
+                    angle =
+                        2.0 * Math.PI *
+                                angleIndex /
+                                ANGLE_SAMPLES,
 
-                boundaryPoints.add(
-                    BoundaryPoint(
-                        angle =
-                            2.0 * Math.PI *
-                                    angleIndex /
-                                    ANGLE_SAMPLES,
-                        radius =
-                            bestRadius,
-                        strength =
-                            bestStrength
-                    )
+                    radius =
+                        bestRadius,
+
+                    strength =
+                        bestStrength
                 )
-            }
-        }
-
-
-        /*
-         * ------------------------------------------------------------
-         * 10. Require enough genuine boundary evidence
-         * ------------------------------------------------------------
-         */
-
-        if (
-            boundaryPoints.size <
-            MIN_VALID_BOUNDARY_POINTS
-        ) {
-            return null
-        }
-
-        /*
-         * ------------------------------------------------------------
-         * Opposite-side boundary coherence
-         * ------------------------------------------------------------
-         *
-         * A genuine circular object should have boundary evidence
-         * on opposite sides of the circle.
-         *
-         * Random grass texture or a shadow edge may produce plenty
-         * of individual edge points, but is much less likely to
-         * produce corresponding evidence at theta and theta + PI.
-         */
-        val oppositePairs = mutableListOf<Double>()
-        val numSamples = boundaryPoints.size
-
-        for (angleIndex in 0 until numSamples / 2) {
-
-            val oppositeIndex =
-                angleIndex + numSamples / 2
-
-            val a =
-                boundaryPoints[angleIndex].strength
-
-            val b =
-                boundaryPoints[oppositeIndex].strength
-
-            /*
-             * Both sides need to have useful evidence.
-             * The weaker side determines the pair strength.
-             */
-            oppositePairs.add(
-                min(a, b)
             )
         }
 
-        val oppositeCoherence =
-            oppositePairs.count {
-                it >= MIN_BOUNDARY_POINT_STRENGTH
-            }.toDouble() /
-                    oppositePairs.size
-
-        if (
-            oppositeCoherence <
-            MIN_OPPOSITE_COHERENCE
-        ) {
-            return null
-        }
 
         /*
          * ------------------------------------------------------------
-         * 11. Boundary coverage
+         * 10. Boundary coverage
          * ------------------------------------------------------------
-         *
-         * Because weak points were discarded above, coverage now
-         * has a much more useful meaning.
          */
 
         val coverage =
-            boundaryPoints.size.toDouble() /
-                    ANGLE_SAMPLES.toDouble()
-
-        if (
-            coverage <
-            MIN_BOUNDARY_COVERAGE
-        ) {
-            return null
-        }
+            boundaryPoints.count {
+                it.strength >=
+                        0.15
+            }.toDouble() /
+                    boundaryPoints.size
 
 
         /*
          * ------------------------------------------------------------
-         * 12. Fit a circle ONLY to genuine boundary points
+         * 11. Convert to Cartesian points
          * ------------------------------------------------------------
          */
 
@@ -1112,16 +1071,30 @@ if (
                 )
             }
 
+
+        /*
+         * ------------------------------------------------------------
+         * 12. Fit circle
+         * ------------------------------------------------------------ */
+
         val fitted =
             fitCircle(
                 cartesianPoints
             )
-                ?: return null
+                ?: return reject(
+                    "FIT_CIRCLE",
+                    String.format(
+                        java.util.Locale.US,
+                        "radius=%.1f coverage=%.3f",
+                        selected.radius,
+                        coverage
+                    )
+                )
 
 
         /*
          * ------------------------------------------------------------
-         * 13. Reject badly fitting circles
+         * 13. RMS rejection
          * ------------------------------------------------------------
          */
 
@@ -1135,13 +1108,25 @@ if (
             fitted.rmsError >
             maximumRmsError
         ) {
-            return null
+
+            return reject(
+                "RMS",
+                String.format(
+                    java.util.Locale.US,
+                    "radius=%.1f rms=%.2f max=%.2f " +
+                            "coverage=%.3f",
+                    fitted.radius,
+                    fitted.rmsError,
+                    maximumRmsError,
+                    coverage
+                )
+            )
         }
 
 
         /*
          * ------------------------------------------------------------
-         * 14. The clicked point must be inside the fitted circle
+         * 14. Click containment
          * ------------------------------------------------------------
          */
 
@@ -1158,15 +1143,23 @@ if (
             clickDistance >
             fitted.radius
         ) {
-            return null
+
+            return reject(
+                "CLICK_OUTSIDE",
+                String.format(
+                    java.util.Locale.US,
+                    "fitRadius=%.1f clickDistance=%.1f",
+                    fitted.radius,
+                    clickDistance
+                )
+            )
         }
 
 
         /*
          * ------------------------------------------------------------
          * 15. Boundary consistency
-         * ------------------------------------------------------------
-         */
+         * ------------------------------------------------------------ */
 
         val radiusMean =
             boundaryPoints
@@ -1178,52 +1171,48 @@ if (
         val radiusVariance =
             boundaryPoints
                 .map {
+
                     val d =
                         it.radius -
                                 radiusMean
 
                     d * d
+
                 }
                 .average()
 
         val radiusStdDev =
-            sqrt(radiusVariance)
+            sqrt(
+                radiusVariance
+            )
+
+        /*
+         * ------------------------------------------------------------
+         * Boundary consistency
+         * ------------------------------------------------------------
+         *
+         * Measure how much the recovered boundary radius varies
+         * relative to the actual object size.
+         *
+         * The previous 15% scale was too aggressive for small
+         * objects: a ~2 px variation on a 13 px object was being
+         * treated as almost completely inconsistent.
+         *
+         * Use 30% of the radius as the tolerance instead.
+         */
+        val consistencyTolerance =
+            max(
+                2.0,
+                selected.radius * 0.30
+            )
 
         val consistency =
             1.0 -
                     min(
                         1.0,
                         radiusStdDev /
-                                max(
-                                    1.0,
-                                    selected.radius * 0.15
-                                )
+                                consistencyTolerance
                     )
-
-
-        /*
- * A genuine object boundary must have:
- *
- *  1. A reasonably stable radius around the circle.
- *  2. A meaningful difference between the inside and outside.
- *
- * Grass texture can generate lots of apparent edge points,
- * but it should not satisfy both of these conditions.
- */
-        /*
-         * These are deliberately fairly weak hard validity tests.
-         *
-         * We only want to eliminate candidates which have essentially
-         * no circularity or no inside/outside distinction.
-         */
-        if (consistency < 0.20) {
-            return null
-        }
-
-        if (separationScore < 0.10) {
-            return null
-        }
-
         /*
          * ------------------------------------------------------------
          * 16. Edge strength
@@ -1240,117 +1229,90 @@ if (
 
         /*
          * ------------------------------------------------------------
-         * 17. Boundary coherence
+         * 17. Current hard validity tests
          * ------------------------------------------------------------
-         *
-         * Measure whether the valid boundary points form substantial
-         * runs around the circumference rather than isolated patches.
          */
 
-        val supportFlags =
-            BooleanArray(
-                ANGLE_SAMPLES
+        if (consistency < 0.20) {
+
+            return reject(
+                "CONSISTENCY",
+                String.format(
+                    java.util.Locale.US,
+                    "radius=%.1f std=%.2f consistency=%.3f " +
+                            "coverage=%.3f separation=%.3f",
+                    fitted.radius,
+                    radiusStdDev,
+                    consistency,
+                    coverage,
+                    separationScore
+                )
             )
-
-        for (point in boundaryPoints) {
-
-            val index =
-                (
-                        point.angle /
-                                (2.0 * Math.PI) *
-                                ANGLE_SAMPLES
-                        )
-                    .roundToInt()
-                    .mod(ANGLE_SAMPLES)
-
-            supportFlags[index] = true
         }
 
-        var longestRun = 0
-        var currentRun = 0
+        if (separationScore < 0.10) {
 
-        for (i in 0 until ANGLE_SAMPLES * 2) {
-
-            if (
-                supportFlags[
-                    i % ANGLE_SAMPLES
-                ]
-            ) {
-
-                currentRun++
-
-                longestRun =
-                    max(
-                        longestRun,
-                        currentRun
-                    )
-
-                if (
-                    currentRun >=
-                    ANGLE_SAMPLES
-                ) {
-                    break
-                }
-
-            } else {
-                currentRun = 0
-            }
-        }
-
-        val longestRunFraction =
-            longestRun.toDouble() /
-                    ANGLE_SAMPLES.toDouble()
-
-        val coherence =
-            sqrt(
-                coverage.coerceIn(0.0, 1.0) *
-                        longestRunFraction
-                            .coerceIn(0.0, 1.0)
+            return reject(
+                "SEPARATION",
+                String.format(
+                    java.util.Locale.US,
+                    "radius=%.1f separation=%.3f " +
+                            "interior=%.3f outside=%.3f " +
+                            "coverage=%.3f consistency=%.3f",
+                    fitted.radius,
+                    separationScore,
+                    interiorSupport,
+                    outsideSupport,
+                    coverage,
+                    consistency
+                )
             )
+        }
 
 
         /*
          * ------------------------------------------------------------
-         * 18. Final confidence
+         * 18. Final score
          * ------------------------------------------------------------
          */
-
-        val fitQuality =
-            (
-                    1.0 -
-                            fitted.rmsError /
-                            maximumRmsError
-                    )
-                .coerceIn(
-                    0.0,
-                    1.0
-                )
 
         val finalScore =
-            selected.score.coerceIn(0.0, 1.0) * 0.15 +
-                    interiorSupport.coerceIn(0.0, 1.0) * 0.15 +
-                    separationScore.coerceIn(0.0, 1.0) * 0.15 +
-                    coverage.coerceIn(0.0, 1.0) * 0.15 +
-                    consistency.coerceIn(0.0, 1.0) * 0.15 +
-                    coherence * 0.15 +
-                    fitQuality * 0.10
+            selected.score * 0.30 +
+                    interiorSupport * 0.20 +
+                    separationScore * 0.15 +
+                    coverage * 0.15 +
+                    consistency * 0.10 +
+                    edgeScore * 0.10
 
 
-        /*
-         * Require a reasonable overall confidence.
-         *
-         * The important rejection has already happened above:
-         * candidates without enough genuine boundary evidence never
-         * get this far.
-         */
-        if (
-            finalScore < 0.45
-        ) {
-            return null
+        if (DIAGNOSTIC) {
+
+            Log.d(
+                TAG,
+                String.format(
+                    java.util.Locale.US,
+                    "ACCEPT centre=(%.1f,%.1f) " +
+                            "radius=%.1f score=%.3f " +
+                            "coverage=%.3f consistency=%.3f " +
+                            "interior=%.3f separation=%.3f " +
+                            "edge=%.3f rms=%.2f",
+                    fitted.centre.x,
+                    fitted.centre.y,
+                    fitted.radius,
+                    finalScore,
+                    coverage,
+                    consistency,
+                    interiorSupport,
+                    separationScore,
+                    edgeScore,
+                    fitted.rmsError
+                )
+            )
         }
 
 
         return BoundaryResult(
+
             centre =
                 fitted.centre,
 
@@ -1366,9 +1328,6 @@ if (
             consistency =
                 consistency,
 
-            coherence =
-                coherence,
-
             interiorSupport =
                 interiorSupport,
 
@@ -1376,14 +1335,19 @@ if (
                 separationScore,
 
             fitQuality =
-                fitQuality,
-
-            oppositeCoherence = oppositeCoherence,
+                min(
+                    1.0,
+                    1.0 -
+                            fitted.rmsError /
+                            maximumRmsError
+                ),
 
             score =
                 finalScore
         )
     }
+
+
     /**
      * Measures whether boundary evidence is distributed coherently around
      * the circumference rather than appearing as isolated patches.

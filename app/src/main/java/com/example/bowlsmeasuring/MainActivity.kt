@@ -42,6 +42,10 @@ import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.core.net.toUri
+import android.os.Build
+import android.Manifest
+import androidx.core.content.ContextCompat
+import android.content.pm.PackageManager
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -225,6 +229,16 @@ private fun BowlsMeasuringScreen(viewModel: BowlsViewModel) {
         }
     }
 
+    val permissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { results ->
+        if (results.all { it.value }) {
+            viewModel.status = "Permissions granted. Click Self Test again."
+        } else {
+            viewModel.status = "Error: Storage permissions are required for Self Test."
+        }
+    }
+
     Column(
         Modifier
             .fillMaxSize()
@@ -262,8 +276,23 @@ private fun BowlsMeasuringScreen(viewModel: BowlsViewModel) {
 
         // Self test button
         OutlinedButton(onClick = {
-//            val path = File(Environment.getExternalStorageDirectory(), "/Download/20260922_105033.jpg")
-//            viewModel.loadUri(context, path.toUri())
+            val permissions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                arrayOf(Manifest.permission.READ_MEDIA_IMAGES)
+            } else {
+                arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
+            }
+
+            val allGranted = permissions.all {
+                ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
+            }
+
+            if (!allGranted) {
+                permissionLauncher.launch(permissions)
+                return@OutlinedButton
+            }
+
+            val path = File(Environment.getExternalStorageDirectory(), "/Download/20260922_105033.jpg")
+            viewModel.loadUri(context, path.toUri())
             viewModel.bitmap?.let { b ->
 
                 scope.launch {
